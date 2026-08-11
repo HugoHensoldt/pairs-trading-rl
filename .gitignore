@@ -1,0 +1,28 @@
+# Dados de tick -- ficam fora do projeto, em C:\Users\HugoV\tick_data
+# (ver src/config.py). Essas regras aqui são só uma segurança extra
+# caso algum JSON acabe sendo copiado pra dentro do projeto por engano.
+*BOVA11.json
+*WINM21.json
+
+# Modelos treinados (também grandes, geram binário diferente a cada treino)
+*.keras
+*.zip
+best_model/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Ambiente / editor
+.env
+.vscode/
+.DS_Store
+
+# Claude Code (config local, não precisa ir pro repo)
+.claude/
