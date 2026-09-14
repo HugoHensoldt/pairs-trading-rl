@@ -19,6 +19,14 @@ python3 -m venv "$ENV_DIR"
 source "$ENV_DIR/bin/activate"
 
 pip install --upgrade pip
+
+# torch é dependência do stable-baselines3, mas o pip install normal
+# baixa a build com CUDA completa (torch + nvidia-cudnn/nccl/cusparselt/
+# etc, ~2GB) mesmo não tendo GPU nesses nós -- instala a build CPU-only
+# primeiro, bem mais leve, pra "requirements.txt" abaixo reaproveitar
+# em vez de baixar a versão GPU.
+pip install "torch>=2.8,<3.0" --index-url https://download.pytorch.org/whl/cpu
+
 pip install -r requirements.txt
 
 echo ""
