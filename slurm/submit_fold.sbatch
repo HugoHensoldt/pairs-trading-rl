@@ -46,10 +46,28 @@ source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
 # diretório de scratch do seu projeto com `ls /scratch/`
 export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 
-# --- margem de segurança sob o MaxTime=00:20:00 do job --------------------
-# 1020s = 17min: para o model.learn() 3min antes do kill do Slurm, dando
-# tempo de sobra pro model.save() terminar antes do hard limit.
-export TRAIN_MAX_SECONDS=1020
+# --- margem de segurança sob o MaxTime=00:20:00 (1200s) do job ------------
+# Contados a partir do início do processo Python (SCRIPT_START), não do
+# início do learn() -- ver TimeLimitCallback em rl_trading_pipeline.py.
+#
+# TRAIN_MAX_SECONDS=780 (13min): para o model.learn() aqui, salva o
+# checkpoint, e ainda sobra tempo pro evaluate_policy() de
+# validação+teste que roda depois.
+# JOB_HARD_SECONDS=1170 (19min30, 30s de colchão antes do kill de
+# verdade): se não sobrar pelo menos EVAL_RESERVE_SECONDS (150s, ver
+# rl_trading_pipeline.py) até essa marca, a avaliação de
+# validação/teste é PULADA em vez de arriscar ser cortada no meio (o
+# checkpoint do modelo já está salvo nesse ponto, então nada se perde
+# de fato -- só o relatório impresso, recuperável depois).
+#
+# Um smoke test real (fold 1, 7 dias de treino) mostrou ~180s de
+# overhead antes do learn() comecar e a avaliação sozinha não terminou
+# em ~90s -- estes valores dão bastante margem sobre isso. Folds com
+# mais dias de treino (ex.: fold 3, 45 dias) tendem a ter overhead de
+# carregamento de dados MAIOR, não menor -- se a folga ainda não for
+# suficiente, aumente esses números.
+export TRAIN_MAX_SECONDS=780
+export JOB_HARD_SECONDS=1170
 
 # --- qual fold treinar --------------------------------------------------
 # slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID antes do sbatch;
@@ -57,6 +75,7 @@ export TRAIN_MAX_SECONDS=1020
 export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
 
 # SLURM_SUBMIT_DIR = diretório de onde `sbatch` foi chamado -- rode
-# `sbatch slurm/submit_fold.sbatch` a partir da raiz do repo
+# `sbatch slurm/submit_fold.sbatch` a partir da raiz do repo clonado em
+# /scratch (não em /prj -- ver comentário no --output acima).
 cd "$SLURM_SUBMIT_DIR/src"
 srun python rl_trading_pipeline.py

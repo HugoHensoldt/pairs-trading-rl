@@ -46,6 +46,17 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import time
+
+# Marca o início real do processo Python -- usado pra calcular quanto
+# tempo de parede (não só tempo de model.learn()) já passou desde que o
+# script começou. Isso importa porque, sob Slurm, o overhead de carregar
+# dados e subir os processos do SubprocVecEnv (~180s observados num
+# smoke test com 48 processos) acontece ANTES do model.learn() comecar
+# --  medir só a partir do learn() deixa esse overhead de fora da conta
+# e comeu a margem de segurança inteira num treino real (ver
+# TimeLimitCallback abaixo).
+SCRIPT_START = time.time()
+
 from functools import partial
 
 import numpy as np
@@ -93,26 +104,27 @@ class TimeLimitCallback(BaseCallback):
 
     O Slurm mata o job na marca exata do --time, sem aviso -- se o
     model.save() ainda não tiver terminado, o checkpoint fica corrompido
-    ou incompleto. Este callback interrompe o `model.learn()` mais cedo
-    (max_seconds < tempo real do job), garantindo tempo de sobra para
-    salvar o modelo antes do kill.
+    ou incompleto. Este callback interrompe o `model.learn()` mais cedo.
+
+    O corte é por DEADLINE absoluto (SCRIPT_START + max_seconds), não por
+    tempo desde o início do learn() -- um smoke test real mostrou ~180s
+    de overhead (carregar dados, subir os 48 processos do
+    SubprocVecEnv) ANTES do learn() começar; contar só a partir do
+    learn() deixava esse overhead de fora da margem e comeu o buffer de
+    segurança inteiro.
     """
 
-    def __init__(self, max_seconds, verbose=0):
+    def __init__(self, deadline, verbose=0):
         super().__init__(verbose)
-        self.max_seconds = max_seconds
-        self._start = None
-
-    def _on_training_start(self):
-        self._start = time.monotonic()
+        self.deadline = deadline
 
     def _on_step(self):
-        elapsed = time.monotonic() - self._start
-        if elapsed > self.max_seconds:
+        now = time.time()
+        if now > self.deadline:
             if self.verbose:
-                print(f"[TimeLimitCallback] {elapsed:.0f}s decorridos "
-                      f"(limite {self.max_seconds:.0f}s) -- parando treino "
-                      f"com margem de segurança.")
+                print(f"[TimeLimitCallback] deadline atingido "
+                      f"({now - self.deadline:.0f}s além do limite) -- "
+                      f"parando treino com margem de segurança.")
             return False
         return True
 
@@ -759,7 +771,10 @@ def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_
 
     callbacks = [eval_callback]
     if max_seconds is not None:
-        callbacks.append(TimeLimitCallback(max_seconds, verbose=1))
+        # max_seconds é contado a partir de SCRIPT_START (início do
+        # processo Python), não do início deste learn() -- ver docstring
+        # de TimeLimitCallback.
+        callbacks.append(TimeLimitCallback(SCRIPT_START + max_seconds, verbose=1))
 
     model.learn(total_timesteps=total_timesteps, callback=CallbackList(callbacks))
     model.save(model_path)
@@ -848,6 +863,31 @@ if __name__ == "__main__":
     max_seconds = os.environ.get("TRAIN_MAX_SECONDS")
     max_seconds = float(max_seconds) if max_seconds else None
 
+    # Deadline duro do job inteiro (contado a partir de SCRIPT_START,
+    # igual ao TimeLimitCallback). O evaluate_policy() de validação/teste
+    # roda DEPOIS do model.learn() já ter parado e salvo o modelo -- sem
+    # essa checagem, um smoke test real mostrou que o Slurm mata o job no
+    # meio dessa avaliação (o modelo fica salvo, mas o relatório de
+    # validação/teste se perde). Se não sobrar reserva suficiente, PULA a
+    # avaliação em vez de arriscar ser matado no meio -- o checkpoint já
+    # está salvo, então dá pra rodar evaluate_policy() depois carregando
+    # ele, sem precisar retreinar.
+    job_hard_seconds = os.environ.get("JOB_HARD_SECONDS")
+    job_hard_deadline = (SCRIPT_START + float(job_hard_seconds)) if job_hard_seconds else None
+    EVAL_RESERVE_SECONDS = 150  # reserva conservadora por chamada de evaluate_policy
+
+    def run_eval_if_time_allows(fold_num, label, orders, model, mean, std):
+        if job_hard_deadline is not None:
+            remaining = job_hard_deadline - time.time()
+            if remaining < EVAL_RESERVE_SECONDS:
+                print(f"\n=== Fold {fold_num} -- Avaliação em {label} PULADA "
+                      f"({remaining:.0f}s restantes, menos que a reserva de "
+                      f"{EVAL_RESERVE_SECONDS}s) -- o checkpoint já está "
+                      f"salvo; rode evaluate_policy() depois carregando-o. ===")
+                return
+        print(f"\n=== Fold {fold_num} -- Avaliação em {label} ===")
+        evaluate_policy(model, orders, mean, std)
+
     for f in folds_to_run:
         print(f"\n########## FOLD {f['fold']}/{len(folds)} ##########")
         model, (mean, std) = train_ppo(
@@ -858,8 +898,5 @@ if __name__ == "__main__":
             max_seconds=max_seconds,
         )
 
-        print(f"\n=== Fold {f['fold']} -- Avaliação em VALIDAÇÃO ===")
-        evaluate_policy(model, f["val_orders"], mean, std)
-
-        print(f"\n=== Fold {f['fold']} -- Avaliação em TESTE ===")
-        evaluate_policy(model, f["test_orders"], mean, std)
+        run_eval_if_time_allows(f["fold"], "VALIDAÇÃO", f["val_orders"], model, mean, std)
+        run_eval_if_time_allows(f["fold"], "TESTE", f["test_orders"], model, mean, std)
