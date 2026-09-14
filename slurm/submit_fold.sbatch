@@ -1,25 +1,29 @@
 #!/bin/bash
-# Treina 1 fold do walk-forward por task do array -- os N_FOLDS folds
-# (hoje 3, ver N_FOLDS em rl_trading_pipeline.py) treinam em paralelo,
-# cada um em 1 nó de 48 núcleos, em vez de em sequência num processo só.
+# Treina 1 fold do walk-forward. A conta ppg-lncc/QOS normal tem
+# MaxSubmit=1 (só 1 job na fila por vez) -- por isso NÃO usamos
+# --array aqui (um array de N tasks conta como N jobs simultâneos pro
+# Slurm e é rejeitado com AssocMaxSubmitJobLimit). Os folds treinam
+# sequencialmente, um job por vez, cada um ainda usando 1 nó/48 núcleos.
 #
-# Uso:
+# Uso direto (roda o fold 1 por padrão):
 #   sbatch slurm/submit_fold.sbatch
+#
+# Pra escolher o fold, ou pra rodar todos em sequência automaticamente,
+# use slurm/submit_all_folds.sh em vez de chamar este arquivo direto.
 #
 # Acompanhar:
 #   squeue --me
-#   tail -f slurm-<jobid>_<taskid>.out
+#   tail -f pairs-rl-fold<N>-<jobid>.out
 
-#SBATCH --job-name=pairs-rl
+#SBATCH --job-name=pairs-rl-fold1
 #SBATCH --partition=sequana_cpu_dev
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
 #SBATCH --time=00:20:00
 #SBATCH --account=ppg-lncc
-#SBATCH --array=1-3
-#SBATCH --output=slurm-%A_%a.out
-#SBATCH --error=slurm-%A_%a.err
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
 
 # Se o cluster exigir QOS explícita (nem toda config de Slurm exige),
 # descomente e ajuste:
@@ -42,6 +46,11 @@ export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 # 1020s = 17min: para o model.learn() 3min antes do kill do Slurm, dando
 # tempo de sobra pro model.save() terminar antes do hard limit.
 export TRAIN_MAX_SECONDS=1020
+
+# --- qual fold treinar --------------------------------------------------
+# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID antes do sbatch;
+# chamando este arquivo direto (sem exportar nada), cai no fold 1.
+export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
 
 # SLURM_SUBMIT_DIR = diretório de onde `sbatch` foi chamado -- rode
 # `sbatch slurm/submit_fold.sbatch` a partir da raiz do repo
