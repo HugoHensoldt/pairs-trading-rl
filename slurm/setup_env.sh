@@ -6,12 +6,14 @@
 #   bash slurm/setup_env.sh
 set -euo pipefail
 
-# AJUSTE: rode `module avail python` e `module avail anaconda` primeiro
-# pra achar o nome exato do módulo disponível no Santos Dumont -- os
-# nomes variam por cluster/versão, não dá pra adivinhar aqui.
-# module load anaconda3/<versao-que-existir>
+# Confirmado via `module avail python` no Santos Dumont (set/2026). Sem
+# isso, o venv cai no python3 default do sistema (3.6.8 -- velho demais:
+# puxa stable-baselines3<2.0, que não suporta a API do gymnasium usada
+# no pipeline).
+module load python/3.10.16_sequana
 
 ENV_DIR="$HOME/envs/pairs-rl"
+rm -rf "$ENV_DIR"  # remove venv antigo (criado sem module load) se existir
 
 python3 -m venv "$ENV_DIR"
 source "$ENV_DIR/bin/activate"

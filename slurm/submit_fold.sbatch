@@ -29,7 +29,7 @@ set -euo pipefail
 
 # --- ambiente Python ---------------------------------------------------
 # mesmo módulo usado em slurm/setup_env.sh -- AJUSTE junto se mudar lá
-# module load anaconda3/<versao-que-existir>
+module load python/3.10.16_sequana
 source "$HOME/envs/pairs-rl/bin/activate"
 
 # --- dados ---------------------------------------------------------------
