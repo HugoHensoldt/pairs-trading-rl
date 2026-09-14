@@ -12,8 +12,14 @@ set -euo pipefail
 # no pipeline).
 module load python/3.10.16_sequana
 
-ENV_DIR="$HOME/envs/pairs-rl"
-rm -rf "$ENV_DIR"  # remove venv antigo (criado sem module load) se existir
+# Venv em /scratch, NÃO em $HOME (/prj) -- descobrimos que o /prj tem
+# lag de propagação entre nós (login/computo veem versões
+# desatualizadas por um tempo depois de escrito), o que já quebrou um
+# job tentando ativar um venv recém-criado ali. /scratch se mostrou
+# consistente em todos os testes.
+ENV_DIR="/scratch/ppg-lncc/$USER/envs/pairs-rl"
+rm -rf "$ENV_DIR"  # remove venv antigo se existir
+mkdir -p "/scratch/ppg-lncc/$USER/pairs-rl-logs"  # saida dos jobs tambem vai pro scratch, mesmo motivo
 
 python3 -m venv "$ENV_DIR"
 source "$ENV_DIR/bin/activate"

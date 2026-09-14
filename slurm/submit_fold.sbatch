@@ -13,7 +13,7 @@
 #
 # Acompanhar:
 #   squeue --me
-#   tail -f pairs-rl-fold<N>-<jobid>.out
+#   tail -f /scratch/ppg-lncc/$USER/pairs-rl-logs/pairs-rl-fold<N>-<jobid>.out
 
 #SBATCH --job-name=pairs-rl-fold1
 #SBATCH --partition=sequana_cpu_dev
@@ -22,8 +22,11 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --time=00:20:00
 #SBATCH --account=ppg-lncc
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+# Logs em /scratch, nao no diretorio do repo (/prj) -- /prj tem lag de
+# propagacao entre nos que ja causou falha (ver job 11594210: nao viu o
+# venv recem-criado). %u/%x/%j sao placeholders do proprio Slurm.
+#SBATCH --output=/scratch/ppg-lncc/%u/pairs-rl-logs/%x-%j.out
+#SBATCH --error=/scratch/ppg-lncc/%u/pairs-rl-logs/%x-%j.err
 
 # Se o cluster exigir QOS explícita (nem toda config de Slurm exige),
 # descomente e ajuste:
@@ -32,9 +35,10 @@
 set -euo pipefail
 
 # --- ambiente Python ---------------------------------------------------
-# mesmo módulo usado em slurm/setup_env.sh -- AJUSTE junto se mudar lá
+# mesmo módulo/caminho usados em slurm/setup_env.sh -- AJUSTE junto se
+# mudar lá. Venv em /scratch (não /prj), ver comentário no --output acima.
 module load python/3.10.16_sequana
-source "$HOME/envs/pairs-rl/bin/activate"
+source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
 
 # --- dados ---------------------------------------------------------------
 # AJUSTE: caminho real depois de copiar os dados pro scratch (ver

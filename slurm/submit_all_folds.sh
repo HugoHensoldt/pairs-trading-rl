@@ -15,7 +15,20 @@ N_FOLDS=3  # mesmo N_FOLDS de src/rl_trading_pipeline.py -- ajuste junto se muda
 
 cd "$(dirname "$0")/.."
 
+# Espera qualquer job pairs-rl-fold* nosso sair da fila antes de
+# submeter o próximo -- cobre tanto sobra de execução anterior quanto
+# um `sbatch` manual disparado por fora deste script (foi exatamente
+# isso que causou AssocMaxSubmitJobLimit na primeira tentativa: um job
+# de teste rodado manualmente ainda contava pro limite MaxSubmit=1).
+wait_for_empty_queue() {
+    while squeue --me --noheader --format="%j" 2>/dev/null | grep -q '^pairs-rl-fold'; do
+        echo "Aguardando fila liberar (ainda há job pairs-rl-fold* ativo)..."
+        sleep 5
+    done
+}
+
 for i in $(seq 1 "$N_FOLDS"); do
+    wait_for_empty_queue
     echo "=== Submetendo fold $i/$N_FOLDS ($(date)) ==="
     SLURM_ARRAY_TASK_ID=$i sbatch --wait \
         --job-name="pairs-rl-fold${i}" \
