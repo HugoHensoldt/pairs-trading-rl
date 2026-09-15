@@ -16,6 +16,11 @@ from pathlib import Path
 # Windows para não precisar escapar as barras invertidas.
 DATA_DIR = Path(os.environ.get("TICK_DATA_DIR", r"/mnt/c/Users/HugoV/tick_data"))
 
+# Valor de 1 ponto do WIN em R$. Usado SÓ para exibição/relatório
+# (prints, docs) -- toda a lógica de reward/PnL do RL e do backtest
+# continua em pontos brutos, por escolha deliberada.
+POINT_VALUE_BRL = 0.20
+
 
 def data_path(filename: str) -> Path:
     """Monta o caminho completo de um arquivo dentro de DATA_DIR."""

@@ -12,7 +12,7 @@ alterou o resultado do backtest.
 import pandas as pd
 import numpy as np
 
-from config import data_path
+from config import data_path, POINT_VALUE_BRL
 
 
 def process_day(order, Periodo=7200, Amostra=1400, sigma=50, Re=0.75, Ri=0.9):
@@ -105,7 +105,11 @@ if __name__ == "__main__":
     for order in range(318, 338):
         df = process_day(order)
 
-        Total = df['lucro'].sum() - (3 * (df.lucro[df.lucro != 0].count())) + df['lu'].iloc[-1]
+        # Custo fixo por negócio: 2.5 pontos == R$0,50 de corretora ao
+        # câmbio de R$0,20/ponto do WIN (POINT_VALUE_BRL) -- `Total` aqui
+        # continua em pontos brutos, igual ao resto do backtest.
+        CUSTO_FIXO_PONTOS = 2.5
+        Total = df['lucro'].sum() - (CUSTO_FIXO_PONTOS * (df.lucro[df.lucro != 0].count())) + df['lu'].iloc[-1]
         n_negocios = df.lucro[df.lucro != 0].count()
         n_lucrativos = df.lucro[df.lucro > 0].count()
         media_razao = ((df['Cask_3k'] + df['Cbid_3k']) / 2).mean()
@@ -113,4 +117,5 @@ if __name__ == "__main__":
 
         # Mesma ordem de informação do print original, mas sem o corte
         # frágil de string por posição -- usa a data já formatada.
-        print(f"{data_primeiro_tick}  {media_razao}  {Total}  {n_negocios}  {n_lucrativos}")
+        print(f"{data_primeiro_tick}  {media_razao}  {Total}  {n_negocios}  {n_lucrativos}"
+              f"  (R$ {Total * POINT_VALUE_BRL:.2f})")

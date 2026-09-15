@@ -71,7 +71,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 
-from config import data_path
+from config import data_path, POINT_VALUE_BRL
 
 # mesma lógica do OMP_NUM_THREADS acima, mas para o processo PRINCIPAL
 # (que roda o forward/backward da rede via torch, concorrendo por CPU com
@@ -277,17 +277,21 @@ class ArbitrageTradingEnv(gym.Env):
     Recompensa: variação de marcação a mercado (mid-price) da posição já
     aberta desde o tick anterior, MENOS custo de execução (metade do
     spread) sempre que uma perna abre/fecha, MENOS taxa fixa cobrada
-    INTEIRAMENTE na abertura (R$0,50, custo real de corretora por
-    negociação). A taxa fixa é concentrada na abertura -- e não dividida
-    ou cobrada no fechamento -- de propósito: isso evita que a ação de
-    fechar concentre custo extra além do spread, o que poderia reforçar
-    relutância do agente em realizar posições perdedoras (efeito
-    parecido com disposition effect).
+    INTEIRAMENTE na abertura (2.5 PONTOS -- equivalente a R$0,50 de custo
+    real de corretora por negociação completa, ao câmbio de R$0,20/ponto
+    do WIN; ver POINT_VALUE_BRL em config.py. `bid`/`ask`/reward aqui
+    ficam em pontos brutos o tempo todo -- não há conversão para R$
+    dentro do ambiente, só na exibição de resultados). A taxa fixa é
+    concentrada na abertura -- e não dividida ou cobrada no fechamento --
+    de propósito: isso evita que a ação de fechar concentre custo extra
+    além do spread, o que poderia reforçar relutância do agente em
+    realizar posições perdedoras (efeito parecido com disposition
+    effect).
     """
 
     metadata = {"render_modes": []}
 
-    def __init__(self, df, feature_matrix, n_ticks=120, transaction_fee=0.5,
+    def __init__(self, df, feature_matrix, n_ticks=120, transaction_fee=2.5,
                  reward_scale=1.0, max_loss_per_position=None):
         super().__init__()
         assert len(df) == len(feature_matrix)
@@ -495,7 +499,7 @@ class MultiDayEnv(gym.Env):
         return self.current_env.step(action)
 
 
-def build_day_envs(orders, mean, std, n_ticks=120, transaction_fee=0.5,
+def build_day_envs(orders, mean, std, n_ticks=120, transaction_fee=2.5,
                     max_loss_per_position=None):
     """Carrega e processa cada pregão em `orders` UMA VEZ, retornando uma
     lista de ArbitrageTradingEnv prontos para uso -- evita reler os JSONs
@@ -515,7 +519,7 @@ def build_day_envs(orders, mean, std, n_ticks=120, transaction_fee=0.5,
     return envs
 
 
-def _make_multiday_env(orders, mean, std, n_ticks=120, transaction_fee=0.5,
+def _make_multiday_env(orders, mean, std, n_ticks=120, transaction_fee=2.5,
                         max_loss_per_position=None):
     """Função construtora usada como env_fn do SubprocVecEnv.
 
@@ -814,7 +818,9 @@ def evaluate_policy(model, orders, mean, std, n_ticks=120):
 
     results_df = pd.DataFrame(results)
     print(results_df)
-    print(f"\nLucro total agregado: {results_df['lucro_total'].sum():.2f}")
+    lucro_total_pontos = results_df['lucro_total'].sum()
+    print(f"\nLucro total agregado: {lucro_total_pontos:.2f} pontos "
+          f"(R$ {lucro_total_pontos * POINT_VALUE_BRL:.2f})")
     print(f"Negócios fechados: {results_df['negocios_fechados'].sum()}")
     print(f"Taxa de acerto: "
           f"{results_df['negocios_vencedores'].sum() / max(results_df['negocios_fechados'].sum(), 1):.2%}")

@@ -1,4 +1,4 @@
-# Relatório de Resultados — RL (PPO) para Pairs Trading BOVA11 x WINM21
+# Relatório de Resultados (versão anterior, com bug de custo fixo) — RL (PPO) para Pairs Trading BOVA11 x WINM21
 
 Walk-forward com 3 folds, treinado no Santos Dumont (LNCC).
 
@@ -41,10 +41,23 @@ longo prazo — achatada em vetor, concatenada com a posição atual
 marcação a mercado (mid-price) da posição já aberta desde o tick
 anterior, **menos** o custo de execução (metade do spread bid-ask)
 sempre que uma perna abre ou fecha, **menos** uma taxa fixa de
-corretora (R$0,50) cobrada inteiramente na abertura da posição (não
-dividida no fechamento — de propósito, para não penalizar
-adicionalmente a decisão de realizar uma posição perdedora). No fim do
-pregão, qualquer posição aberta é fechada automaticamente.
+corretora cobrada inteiramente na abertura da posição (não dividida no
+fechamento — de propósito, para não penalizar adicionalmente a decisão
+de realizar uma posição perdedora). No fim do pregão, qualquer posição
+aberta é fechada automaticamente.
+
+> **Nota sobre unidades (adicionada após revisão):** toda a recompensa,
+> P&L e "Lucro total" deste relatório estão em **PONTOS do WIN**, não em
+> R$ — o ambiente (`ArbitrageTradingEnv`) opera inteiramente em pontos
+> brutos, sem nenhuma conversão para R$ internamente. Para converter
+> qualquer valor deste relatório para R$, multiplique por **0,20**
+> (1 ponto do WIN = R$0,20). A taxa fixa de corretora correta é de
+> **2.5 pontos** (== R$0,50 por negociação completa, o custo real
+> informado). A rodada usada para gerar os resultados abaixo foi
+> treinada com a taxa fixa antiga, de **0.5 pontos** (== R$0,10) — 5x
+> menor que o valor correto — então os números desta seção não refletem
+> o custo de transação real e uma nova rodada de treino/avaliação é
+> necessária para números corretos.
 
 **PPO — hiperparâmetros:**
 
@@ -74,6 +87,9 @@ timesteps usado — sinal de que o treino provavelmente se beneficiaria
 de mais timesteps/tempo de treino do que o orçamento atual permite.
 
 ## 4. Resultados de avaliação
+
+*(valores em **pontos do WIN**, não R$ — ver nota de unidades na seção 2;
+multiplique por 0,20 para converter para R$)*
 
 | Fold | Conjunto | Lucro total | Taxa de acerto | Negócios | Lucro médio/negócio |
 |---|---|---|---|---|---|
