@@ -46,13 +46,19 @@ source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
 # diretório de scratch do seu projeto com `ls /scratch/`
 export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 
+# --- qual fold treinar / treino em chunks (resume) ------------------------
+# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID (fold) e, quando
+# N_CHUNKS_PER_FOLD > 1, também RESUME_TRAINING/FINAL_CHUNK. Chamando
+# este arquivo direto (sem exportar nada), os defaults preservam o
+# comportamento de sempre: fold 1, treina do zero, avalia ao final.
+export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+export RESUME_TRAINING="${RESUME_TRAINING:-0}"
+export FINAL_CHUNK="${FINAL_CHUNK:-1}"
+
 # --- margem de segurança sob o MaxTime=00:20:00 (1200s) do job ------------
 # Contados a partir do início do processo Python (SCRIPT_START), não do
 # início do learn() -- ver TimeLimitCallback em rl_trading_pipeline.py.
 #
-# TRAIN_MAX_SECONDS=780 (13min): para o model.learn() aqui, salva o
-# checkpoint, e ainda sobra tempo pro evaluate_policy() de
-# validação+teste que roda depois.
 # JOB_HARD_SECONDS=1170 (19min30, 30s de colchão antes do kill de
 # verdade): se não sobrar pelo menos EVAL_RESERVE_SECONDS (150s, ver
 # rl_trading_pipeline.py) até essa marca, a avaliação de
@@ -60,19 +66,27 @@ export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 # checkpoint do modelo já está salvo nesse ponto, então nada se perde
 # de fato -- só o relatório impresso, recuperável depois).
 #
+# TRAIN_MAX_SECONDS varia conforme FINAL_CHUNK (ver slurm/submit_all_folds.sh
+# pra como isso é orquestrado num treino em vários chunks encadeados):
+# - chunk final (FINAL_CHUNK=1, ou não setado -- job único como antes):
+#   780s (13min), reservando tempo pro evaluate_policy() de validação+
+#   teste que roda depois do learn().
+# - chunk intermediário (FINAL_CHUNK=0): não faz avaliação, então pode
+#   treinar bem mais perto do limite de 20min -- 1140s (19min), só
+#   reservando tempo pro model.save() final e encerramento do job.
+#
 # Um smoke test real (fold 1, 7 dias de treino) mostrou ~180s de
 # overhead antes do learn() comecar e a avaliação sozinha não terminou
 # em ~90s -- estes valores dão bastante margem sobre isso. Folds com
 # mais dias de treino (ex.: fold 3, 45 dias) tendem a ter overhead de
 # carregamento de dados MAIOR, não menor -- se a folga ainda não for
 # suficiente, aumente esses números.
-export TRAIN_MAX_SECONDS=780
 export JOB_HARD_SECONDS=1170
-
-# --- qual fold treinar --------------------------------------------------
-# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID antes do sbatch;
-# chamando este arquivo direto (sem exportar nada), cai no fold 1.
-export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+if [ "$FINAL_CHUNK" = "1" ]; then
+    export TRAIN_MAX_SECONDS=780
+else
+    export TRAIN_MAX_SECONDS=1140
+fi
 
 # SLURM_SUBMIT_DIR = diretório de onde `sbatch` foi chamado -- rode
 # `sbatch slurm/submit_fold.sbatch` a partir da raiz do repo clonado em

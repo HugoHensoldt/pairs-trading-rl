@@ -693,7 +693,7 @@ def generate_walk_forward_folds(
 
 def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_000,
               model_path="ppo_arbitrage.zip", best_model_dir="./best_model",
-              max_seconds=None):
+              max_seconds=None, resume_from=None):
     # a normalização é ajustada SOMENTE com os dias de treino
     train_dfs_feats = []
     for order in train_orders:
@@ -743,15 +743,23 @@ def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_
     batch_size = 1024
     assert n_steps % batch_size == 0, "batch_size deve dividir n_steps (e portanto n_steps × n_train_envs)"
 
-    model = PPO(
-        "MlpPolicy",
-        vec_train_env,
-        learning_rate=3e-4,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        gamma=0.999,        # horizonte longo: episódio = um pregão inteiro
-        verbose=1,
-    )
+    # resume_from: continua o treino de um checkpoint já salvo (de um job
+    # anterior, ver TREINO EM CHUNKS abaixo) em vez de começar do zero --
+    # os hiperparâmetros (learning_rate, n_steps, etc.) já vêm salvos no
+    # checkpoint, não são reaplicados aqui.
+    if resume_from is not None and os.path.exists(resume_from):
+        print(f"Retomando treino a partir de '{resume_from}'.")
+        model = PPO.load(resume_from, env=vec_train_env)
+    else:
+        model = PPO(
+            "MlpPolicy",
+            vec_train_env,
+            learning_rate=3e-4,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            gamma=0.999,        # horizonte longo: episódio = um pregão inteiro
+            verbose=1,
+        )
 
     # eval_freq: no EvalCallback do SB3, `eval_freq` é contado em chamadas
     # de callback (uma por env.step() do VecEnv), NÃO em timesteps totais
@@ -766,6 +774,11 @@ def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_
     n_avaliacoes_alvo = 18  # meio do intervalo 15-20 pedido
     eval_freq = max(1, int(total_timesteps / (n_avaliacoes_alvo * n_train_envs)))
 
+    # Nota (treino em chunks/resume): best_mean_reward começa em -inf a
+    # cada chamada desta função, então best_model_dir pode ser
+    # sobrescrito por um modelo deste chunk pior que o melhor de um
+    # chunk anterior. Por isso o resume_from acima sempre usa model_path
+    # (checkpoint "cru" salvo ao fim de cada chunk), nunca best_model_dir.
     eval_callback = EvalCallback(
         vec_val_env, best_model_save_path=best_model_dir,
         eval_freq=eval_freq,
@@ -780,7 +793,15 @@ def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_
         # de TimeLimitCallback.
         callbacks.append(TimeLimitCallback(SCRIPT_START + max_seconds, verbose=1))
 
-    model.learn(total_timesteps=total_timesteps, callback=CallbackList(callbacks))
+    # reset_num_timesteps=False ao retomar: NÃO zera o contador interno de
+    # timesteps do SB3, então total_timesteps aqui passa a significar
+    # "treinar total_timesteps A MAIS a partir de onde parou" (semântica
+    # do próprio SB3 quando reset_num_timesteps=False). Cada chunk só
+    # consegue treinar uma fração pequena disso no tempo real disponível
+    # (ver TimeLimitCallback) -- não precisa descontar steps já feitos
+    # manualmente, o corte real é por tempo de parede, não por contagem.
+    model.learn(total_timesteps=total_timesteps, callback=CallbackList(callbacks),
+                reset_num_timesteps=(resume_from is None))
     model.save(model_path)
 
     return model, (mean, std)
@@ -894,15 +915,30 @@ if __name__ == "__main__":
         print(f"\n=== Fold {fold_num} -- Avaliação em {label} ===")
         evaluate_policy(model, orders, mean, std)
 
+    # Treino em chunks: RESUME_TRAINING=1 retoma do checkpoint do fold
+    # (job anterior na mesma cadeia) em vez de treinar do zero;
+    # FINAL_CHUNK=0 pula a avaliação de val/teste (ainda vai treinar mais
+    # depois). Sem essas env vars (execução local ou job único), o
+    # default preserva o comportamento de sempre: treina do zero e avalia
+    # ao final -- ver slurm/submit_all_folds.sh pra como isso é orquestrado.
+    resume_training = os.environ.get("RESUME_TRAINING", "0") == "1"
+    final_chunk = os.environ.get("FINAL_CHUNK", "1") == "1"
+
     for f in folds_to_run:
         print(f"\n########## FOLD {f['fold']}/{len(folds)} ##########")
+        model_path = f"ppo_arbitrage_fold{f['fold']}.zip"
         model, (mean, std) = train_ppo(
             f["train_orders"], f["val_orders"],
             total_timesteps=f["total_timesteps"],
-            model_path=f"ppo_arbitrage_fold{f['fold']}.zip",
+            model_path=model_path,
             best_model_dir=f"./best_model_fold{f['fold']}",
             max_seconds=max_seconds,
+            resume_from=(model_path if resume_training else None),
         )
 
-        run_eval_if_time_allows(f["fold"], "VALIDAÇÃO", f["val_orders"], model, mean, std)
-        run_eval_if_time_allows(f["fold"], "TESTE", f["test_orders"], model, mean, std)
+        if final_chunk:
+            run_eval_if_time_allows(f["fold"], "VALIDAÇÃO", f["val_orders"], model, mean, std)
+            run_eval_if_time_allows(f["fold"], "TESTE", f["test_orders"], model, mean, std)
+        else:
+            print(f"\n=== Fold {f['fold']} -- chunk intermediário, avaliação "
+                  f"fica pro chunk final (FINAL_CHUNK=1) ===")

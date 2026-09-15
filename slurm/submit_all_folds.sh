@@ -13,6 +13,13 @@ set -euo pipefail
 
 N_FOLDS=3  # mesmo N_FOLDS de src/rl_trading_pipeline.py -- ajuste junto se mudar lá
 
+# Quantos jobs de 20min encadear POR FOLD, cada um retomando do
+# checkpoint do anterior (ver RESUME_TRAINING/FINAL_CHUNK em
+# rl_trading_pipeline.py e slurm/submit_fold.sbatch). Default 1 =
+# comportamento de sempre (1 job, treina do zero, avalia ao final).
+# Só o último chunk de cada fold roda a avaliação de validação/teste.
+N_CHUNKS_PER_FOLD=1
+
 cd "$(dirname "$0")/.."
 
 # Espera qualquer job pairs-rl-fold* nosso sair da fila antes de
@@ -28,13 +35,20 @@ wait_for_empty_queue() {
 }
 
 for i in $(seq 1 "$N_FOLDS"); do
-    wait_for_empty_queue
-    echo "=== Submetendo fold $i/$N_FOLDS ($(date)) ==="
-    SLURM_ARRAY_TASK_ID=$i sbatch --wait \
-        --job-name="pairs-rl-fold${i}" \
-        --export=ALL,SLURM_ARRAY_TASK_ID="$i" \
-        slurm/submit_fold.sbatch
-    echo "=== Fold $i concluído ($(date)) ==="
+    for chunk in $(seq 1 "$N_CHUNKS_PER_FOLD"); do
+        resume=1
+        if [ "$chunk" -eq 1 ]; then resume=0; fi
+        final=0
+        if [ "$chunk" -eq "$N_CHUNKS_PER_FOLD" ]; then final=1; fi
+
+        wait_for_empty_queue
+        echo "=== Submetendo fold $i/$N_FOLDS, chunk $chunk/$N_CHUNKS_PER_FOLD ($(date)) ==="
+        sbatch --wait \
+            --job-name="pairs-rl-fold${i}" \
+            --export=ALL,SLURM_ARRAY_TASK_ID="$i",RESUME_TRAINING="$resume",FINAL_CHUNK="$final" \
+            slurm/submit_fold.sbatch
+        echo "=== Fold $i, chunk $chunk concluído ($(date)) ==="
+    done
 done
 
 echo "=== Todos os $N_FOLDS folds concluídos ==="
