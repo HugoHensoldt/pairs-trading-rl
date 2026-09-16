@@ -31,6 +31,7 @@ Estrutura:
                                 número de negociações e taxa de acerto
 """
 
+import math
 import os
 
 # Evita oversubscription de threads BLAS/OMP: em cluster (Santos Dumont),
@@ -546,9 +547,9 @@ def generate_walk_forward_folds(
     train_frac=0.70,
     val_frac=0.15,
     test_frac=0.15,
-    time_budget_hours=5.0,
+    target_n_passadas=20.0,
     throughput_steps_per_sec=4209.0,
-    min_visits_per_train_day=20,
+    chunk_seconds=1140.0,
     avg_ticks_per_day=None,
     verbose=True,
 ):
@@ -569,28 +570,33 @@ def generate_walk_forward_folds(
     dias de treino. Isso é esperado em walk-forward CV com janela
     expansiva.
 
-    `time_budget_hours` é o orçamento TOTAL somado entre todos os folds
-    (não por fold) -- é dividido igualmente por `n_folds` para chegar
-    no orçamento de tempo/timesteps de cada fold individual. Ex.:
-    time_budget_hours=5.0 com n_folds=3 -> ~1h40 (~5h/3) de treino por
-    fold, ~5h no total rodando os 3 folds em sequência.
+    `target_n_passadas` é o número de vezes, em média, que cada dia de
+    treino deve ser visitado pelo MultiDayEnv -- e é o MESMO para todos
+    os folds (ao contrário de uma versão anterior que fixava um
+    orçamento de TEMPO total igual pra todos os folds, o que fazia
+    folds pequenos serem revisitados dezenas de vezes a mais que o
+    fold grande e overfitarem: um teste real no Santos Dumont mostrou o
+    fold 1, com 7 dias de treino, chegando a ~128 passadas/dia contra
+    ~20 do fold 3 -- justamente o fold 1 foi o único com teste negativo
+    apesar de validação ótima, sinal clássico de overfitting). Com
+    `target_n_passadas` fixo, `total_timesteps` de cada fold cresce
+    proporcionalmente ao seu número de dias de treino, em vez de ser
+    igual para todos.
 
-    O tamanho do último fold (o maior) é limitado por esse orçamento:
-    dado o throughput medido (`throughput_steps_per_sec` -- default é o
-    fps real de treino PPO medido no smoke test do SubprocVecEnv da
-    tarefa 3 NESTA máquina; ajuste este valor ao rodar em outra
-    máquina), calcula-se quantos timesteps cabem por fold, o que por
-    sua vez limita quantos dias de treino cabem no último fold, de
-    forma que cada dia, em média, seja visitado pelo menos
-    `min_visits_per_train_day` vezes (com poucos timesteps e muitos
-    dias, cada dia seria raramente visitado pelo MultiDayEnv -- melhor
-    usar menos dias e visitar cada um o suficiente).
+    `throughput_steps_per_sec` (fps real de treino PPO medido no
+    SubprocVecEnv -- RECALIBRAR ao trocar de máquina, ex.: o node do
+    Santos Dumont tem fps diferente do PC doméstico onde o default
+    abaixo foi medido) e `chunk_seconds` (tempo real de treino por job
+    Slurm encadeado -- ver TRAIN_MAX_SECONDS em submit_fold.sbatch para
+    o chunk intermediário) convertem `total_timesteps` em
+    `n_chunks_needed`: quantos jobs de ~20min encadeados (checkpoint+
+    resume) são necessários pra completar aquele fold.
 
     Retorna uma lista de dicts, um por fold, com "fold", "train_orders",
-    "val_orders", "test_orders", "total_timesteps" (orçamento de
-    timesteps calibrado para aquele fold -- ver comentário na conta
-    logo abaixo) e "n_passadas_medias" (quantas vezes, em média, cada
-    dia de treino daquele fold é visitado dentro desse orçamento).
+    "val_orders", "test_orders", "total_timesteps" (calibrado para dar
+    `target_n_passadas` passadas médias naquele fold), "n_passadas_medias"
+    (== target_n_passadas, constante entre folds por construção) e
+    "n_chunks_needed" (quantos jobs Slurm de `chunk_seconds` encadear).
     """
     assert abs((train_frac + val_frac + test_frac) - 1.0) < 1e-9
     assert n_folds >= 2, "TimeSeriesSplit exige n_folds >= 2"
@@ -599,31 +605,15 @@ def generate_walk_forward_folds(
         sample_orders = all_orders[:2]
         avg_ticks_per_day = float(np.mean([len(process_day(o)) for o in sample_orders]))
 
-    # --- Cálculo do orçamento de timesteps por fold ---
-    # time_budget_hours é o orçamento TOTAL entre todos os folds (decisão
-    # confirmada com o usuário), então cada fold recebe uma fração igual:
-    budget_seconds_per_fold = (time_budget_hours * 3600.0) / n_folds
-    # throughput_steps_per_sec (medido empiricamente, tarefa 3) converte
-    # esse tempo em quantos timesteps cabem no orçamento daquele fold:
-    timesteps_budget_per_fold = throughput_steps_per_sec * budget_seconds_per_fold
-
-    # total_timesteps de um fold = dias_treino × ticks_por_dia × n_passadas
-    # (n_passadas = quantas vezes, em média, o MultiDayEnv visita cada dia
-    # de treino dentro do orçamento). Aqui usamos essa mesma equação ao
-    # contrário para dimensionar o fold: fixamos n_passadas em
-    # min_visits_per_train_day (queremos garantir esse mínimo de
-    # cobertura por dia) e resolvemos para dias_treino, dado o orçamento
-    # de timesteps já calculado acima:
-    #   dias_treino = timesteps_budget_per_fold / (ticks_por_dia × n_passadas)
-    max_train_days = int(timesteps_budget_per_fold / (avg_ticks_per_day * min_visits_per_train_day))
-    max_train_days = max(max_train_days, n_folds)  # ao menos 1 dia de treino por fold
-
-    # tamanho do bloco val+teste calibrado para que o ÚLTIMO fold (o
-    # maior) fique próximo de train_frac/val_frac/test_frac
-    last_fold_window = int(round(max_train_days / train_frac))
-    test_size = max(1, int(round(last_fold_window * (val_frac + test_frac))))
-
-    n_samples_total = min(max_train_days + test_size, len(all_orders))
+    # Sem orçamento de tempo total a respeitar (isso só fazia sentido pro
+    # PC doméstico): usa todos os pregões disponíveis, calibrando só o
+    # tamanho do bloco val+teste pela proporção desejada. Para o ÚLTIMO
+    # fold (o maior), TimeSeriesSplit dá train ≈ N - test_size, então
+    # test_size = N × (val_frac+test_frac) já deixa o último fold próximo
+    # de train_frac/val_frac/test_frac sem precisar calcular um
+    # "max_train_days" auxiliar.
+    n_samples_total = len(all_orders)
+    test_size = max(1, int(round(n_samples_total * (val_frac + test_frac))))
     min_required = n_folds * test_size + 1
     if n_samples_total < min_required:
         n_samples_total = min(min_required, len(all_orders))
@@ -644,16 +634,15 @@ def generate_walk_forward_folds(
         val_orders = [orders_used[j] for j in val_idx]
         test_orders = [orders_used[j] for j in test_idx]
 
-        # total_timesteps do fold = orçamento de timesteps do fold (fixo,
-        # dividido igualmente entre os folds -- ver acima). Como
-        # dias_treino VARIA por fold (janela expansiva: cresce a cada
-        # fold), o número de passadas médias por dia de treino que esse
-        # mesmo orçamento compra também varia -- é isso que
-        # n_passadas_medias documenta abaixo:
-        #   n_passadas_medias = total_timesteps / (dias_treino × ticks_por_dia)
+        # total_timesteps do fold = target_n_passadas × dias_treino ×
+        # ticks_por_dia -- CRESCE com o tamanho do fold (ao contrário da
+        # versão anterior, que fixava total_timesteps e deixava
+        # n_passadas_medias variar). n_chunks_needed traduz isso em
+        # quantos jobs Slurm de chunk_seconds encadear pra esse fold.
         dias_treino = len(train_orders)
-        total_timesteps_fold = int(timesteps_budget_per_fold)
-        n_passadas_medias = total_timesteps_fold / (dias_treino * avg_ticks_per_day)
+        total_timesteps_fold = int(round(target_n_passadas * dias_treino * avg_ticks_per_day))
+        timesteps_per_chunk = throughput_steps_per_sec * chunk_seconds
+        n_chunks_needed = max(1, math.ceil(total_timesteps_fold / timesteps_per_chunk))
 
         folds.append({
             "fold": i,
@@ -661,19 +650,18 @@ def generate_walk_forward_folds(
             "val_orders": val_orders,
             "test_orders": test_orders,
             "total_timesteps": total_timesteps_fold,
-            "n_passadas_medias": n_passadas_medias,
+            "n_passadas_medias": target_n_passadas,
+            "n_chunks_needed": n_chunks_needed,
         })
 
     if verbose:
         print(f"=== Folds walk-forward (TimeSeriesSplit, n_folds={n_folds}) ===")
         print(f"Throughput assumido : {throughput_steps_per_sec:,.0f} steps/s  "
               f"(ajuste para a máquina onde for treinar)")
-        print(f"Orçamento total     : {time_budget_hours:.1f}h somadas entre os {n_folds} folds  ->  "
-              f"{timesteps_budget_per_fold:,.0f} timesteps/fold "
-              f"(~{time_budget_hours / n_folds:.2f}h/fold)")
+        print(f"Passadas-alvo/dia   : {target_n_passadas:.1f} (igual para todos os folds)")
+        print(f"Chunk (job Slurm)   : {chunk_seconds:.0f}s de treino real por job encadeado")
         print(f"Ticks médios/pregão : {avg_ticks_per_day:,.0f}")
-        print(f"Pregões disponíveis : {len(all_orders)}  |  pregões usados: {len(orders_used)} "
-              f"(limitado pelo orçamento de tempo)")
+        print(f"Pregões disponíveis : {len(all_orders)}  |  pregões usados: {len(orders_used)}")
         for f in folds:
             tr, va, te = f["train_orders"], f["val_orders"], f["test_orders"]
             assert tr[-1] < va[0] <= va[-1] < te[0] <= te[-1], \
@@ -682,7 +670,8 @@ def generate_walk_forward_folds(
                   f"validação=[{va[0]:>3}..{va[-1]:>3}] ({len(va):>3} dias)  "
                   f"teste=[{te[0]:>3}..{te[-1]:>3}] ({len(te):>3} dias)  "
                   f"total_timesteps={f['total_timesteps']:,} "
-                  f"(~{f['n_passadas_medias']:.1f} passadas/dia de treino)")
+                  f"(~{f['n_passadas_medias']:.1f} passadas/dia de treino, "
+                  f"{f['n_chunks_needed']} chunk(s) de {chunk_seconds:.0f}s)")
 
     return folds
 
@@ -873,9 +862,38 @@ def evaluate_policy(model, orders, mean, std, n_ticks=120):
 if __name__ == "__main__":
     all_orders = list(range(1, 481))  # 480 pregões disponíveis, em ordem cronológica
 
+    # MAX_PREGOES limita quantos pregões (do início, cronologicamente)
+    # usar -- útil pra rodadas menores/mais rápidas sem esperar os 68
+    # chunks que os 480 pregões completos exigem com TARGET_N_PASSADAS=20
+    # (ver conversa: escala escolhida por enquanto é usar bem menos que
+    # os 480 disponíveis). Sem a env var, usa todos.
+    max_pregoes = os.environ.get("MAX_PREGOES")
+    if max_pregoes:
+        all_orders = all_orders[:int(max_pregoes)]
+
     N_FOLDS = 3  # configurável: quantos folds walk-forward gerar
 
-    folds = generate_walk_forward_folds(all_orders, n_folds=N_FOLDS)
+    # Lidos de env var pra permitir recalibrar sem editar código -- em
+    # especial THROUGHPUT_STEPS_PER_SEC, que deve ser remedido no node
+    # real do Santos Dumont (o default foi medido no PC doméstico) antes
+    # de confiar no n_chunks_needed calculado abaixo pros folds maiores.
+    target_n_passadas = float(os.environ.get("TARGET_N_PASSADAS", "20.0"))
+    throughput_steps_per_sec = float(os.environ.get("THROUGHPUT_STEPS_PER_SEC", "4209.0"))
+
+    folds = generate_walk_forward_folds(
+        all_orders, n_folds=N_FOLDS,
+        target_n_passadas=target_n_passadas,
+        throughput_steps_per_sec=throughput_steps_per_sec,
+    )
+
+    # Modo usado por slurm/submit_all_folds.sh pra descobrir quantos
+    # chunks de 20min encadear POR FOLD (n_chunks_needed varia por fold,
+    # ver generate_walk_forward_folds) sem duplicar essa conta em bash --
+    # imprime "<fold> <n_chunks_needed>" por linha e sai, sem treinar nada.
+    if os.environ.get("PRINT_FOLD_PLAN") == "1":
+        for f in folds:
+            print(f"{f['fold']} {f['n_chunks_needed']}")
+        raise SystemExit(0)
 
     # Sob Slurm job array (--array=1-N_FOLDS), cada task treina só o fold
     # correspondente ao seu índice, em vez de rodar os N_FOLDS em

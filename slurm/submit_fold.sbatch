@@ -47,13 +47,21 @@ source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
 export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 
 # --- qual fold treinar / treino em chunks (resume) ------------------------
-# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID (fold) e, quando
-# N_CHUNKS_PER_FOLD > 1, também RESUME_TRAINING/FINAL_CHUNK. Chamando
-# este arquivo direto (sem exportar nada), os defaults preservam o
-# comportamento de sempre: fold 1, treina do zero, avalia ao final.
+# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID (fold) e, quando o
+# fold precisa de mais de 1 chunk pra chegar em TARGET_N_PASSADAS (ver
+# generate_walk_forward_folds), também RESUME_TRAINING/FINAL_CHUNK.
+# Chamando este arquivo direto (sem exportar nada), os defaults preservam
+# o comportamento de sempre: fold 1, treina do zero, avalia ao final.
 export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
 export RESUME_TRAINING="${RESUME_TRAINING:-0}"
 export FINAL_CHUNK="${FINAL_CHUNK:-1}"
+
+# Escolha de hoje (2026-09-16): usar bem menos que os 480 pregões
+# disponíveis (ver MAX_PREGOES em rl_trading_pipeline.py) -- mesmo default
+# usado em slurm/submit_all_folds.sh, repetido aqui pra quem chamar este
+# arquivo direto (sem passar por submit_all_folds.sh) também ficar na
+# mesma escala reduzida em vez de cair nos 480 pregões completos.
+export MAX_PREGOES="${MAX_PREGOES:-80}"
 
 # --- margem de segurança sob o MaxTime=00:20:00 (1200s) do job ------------
 # Contados a partir do início do processo Python (SCRIPT_START), não do
@@ -74,6 +82,13 @@ export FINAL_CHUNK="${FINAL_CHUNK:-1}"
 # - chunk intermediário (FINAL_CHUNK=0): não faz avaliação, então pode
 #   treinar bem mais perto do limite de 20min -- 1140s (19min), só
 #   reservando tempo pro model.save() final e encerramento do job.
+#
+# IMPORTANTE: os 1140s do chunk intermediário são o mesmo valor do
+# default `chunk_seconds` em generate_walk_forward_folds()
+# (rl_trading_pipeline.py) -- é isso que converte total_timesteps em
+# n_chunks_needed por fold. Mudar um sem o outro faz o número de chunks
+# planejado (PRINT_FOLD_PLAN) não bater com o tempo real disponível por
+# job.
 #
 # Um smoke test real (fold 1, 7 dias de treino) mostrou ~180s de
 # overhead antes do learn() comecar e a avaliação sozinha não terminou
