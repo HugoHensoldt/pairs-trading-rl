@@ -38,6 +38,13 @@ cd "$(dirname "$0")/.."
 # quiser recalibrar -- em especial THROUGHPUT_STEPS_PER_SEC depois de
 # medir o fps real no node do Santos Dumont (ver fold 1 rodando antes
 # de confiar no plano pros folds maiores).
+# O cálculo do plano roda aqui no login node (fora do sbatch), então
+# precisa ativar o mesmo venv/módulo que submit_fold.sbatch usa --
+# sem isso, "python3" cai no Python do sistema, sem pandas/gymnasium/etc.
+module load python/3.10.16_sequana
+source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
+export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
+
 echo "=== Calculando plano de chunks por fold (TARGET_N_PASSADAS=${TARGET_N_PASSADAS:-20.0}) ==="
 declare -A CHUNKS_POR_FOLD
 while read -r fold_num n_chunks; do
