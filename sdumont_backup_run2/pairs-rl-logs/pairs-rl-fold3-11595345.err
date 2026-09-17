@@ -1,0 +1,2 @@
+/scratch/ppg-lncc/hugo.hensoldt/envs/pairs-rl/lib/python3.10/site-packages/stable_baselines3/common/callbacks.py:419: UserWarning: Training and eval env are not of the same type<stable_baselines3.common.vec_env.subproc_vec_env.SubprocVecEnv object at 0x14bc6d5fd420> != <stable_baselines3.common.vec_env.dummy_vec_env.DummyVecEnv object at 0x14bc6b2d4370>
+  warnings.warn("Training and eval env are not of the same type" f"{self.training_env} != {self.eval_env}")

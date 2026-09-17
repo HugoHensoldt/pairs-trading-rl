@@ -2,6 +2,9 @@
 
 Walk-forward com 3 folds, treinado no Santos Dumont (LNCC).
 
+> Ver [relatorio_resultados_v2.md](relatorio_resultados_v2.md) para a
+> rodada seguinte, com o custo de transação corrigido.
+
 ## 1. Metodologia
 
 O agente opera **tick a tick** em um único pregão por episódio

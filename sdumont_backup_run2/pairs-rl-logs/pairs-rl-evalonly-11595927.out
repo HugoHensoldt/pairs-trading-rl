@@ -1,0 +1,75 @@
+=== Folds walk-forward (TimeSeriesSplit, n_folds=3) ===
+Throughput assumido : 4,209 steps/s  (ajuste para a máquina onde for treinar)
+Passadas-alvo/dia   : 20.0 (igual para todos os folds)
+Chunk (job Slurm)   : 1140s de treino real por job encadeado
+Ticks médios/pregão : 27,662
+Pregões disponíveis : 80  |  pregões usados: 80
+  Fold 1: treino=[  1..  8] (  8 dias)  validação=[  9.. 20] ( 12 dias)  teste=[ 21.. 32] ( 12 dias)  total_timesteps=4,425,920 (~20.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+  Fold 2: treino=[  1.. 32] ( 32 dias)  validação=[ 33.. 44] ( 12 dias)  teste=[ 45.. 56] ( 12 dias)  total_timesteps=17,703,680 (~20.0 passadas/dia de treino, 4 chunk(s) de 1140s)
+  Fold 3: treino=[  1.. 56] ( 56 dias)  validação=[ 57.. 68] ( 12 dias)  teste=[ 69.. 80] ( 12 dias)  total_timesteps=30,981,440 (~20.0 passadas/dia de treino, 7 chunk(s) de 1140s)
+
+########## FOLD 1 -- AVALIAÇÃO ISOLADA (checkpoint: ppo_arbitrage_fold1.zip) ##########
+
+=== Fold 1 -- Avaliação em VALIDAÇÃO ===
+    order  lucro_total  negocios_fechados  negocios_vencedores
+0       9         80.0                  8                    5
+1      10         52.5                  1                    1
+2      11        167.5                  3                    3
+3      12         10.0                  4                    2
+4      13         25.0                  4                    2
+5      14         85.0                  6                    4
+6      15        -80.0                  4                    0
+7      16         35.0                  2                    1
+8      17         47.5                  5                    3
+9      18        110.0                 18                    7
+10     19          7.5                  3                    1
+11     20         10.0                  2                    1
+
+Lucro total agregado: 550.00 pontos (R$ 110.00)
+Negócios fechados: 60
+Taxa de acerto: 50.00%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 60  |  vencedores: 30  |  perdedores: 30
+Ganho médio       : 31.33   |  mediana: 27.50   |  máximo: 187.50
+Perda média       : -13.00   |  mediana: -7.50   |  mínimo: -97.50
+Perda média / Ganho médio: 0.41x
+  percentil  1: -62.10
+  percentil  5: -22.75
+  percentil 25: -7.50
+  percentil 50: 0.00
+  percentil 75: 27.50
+  percentil 95: 52.50
+  percentil 99: 116.70
+
+=== Fold 1 -- Avaliação em TESTE ===
+    order  lucro_total  negocios_fechados  negocios_vencedores
+0      21        -35.0                  6                    1
+1      22        -80.0                  8                    1
+2      23        -57.5                  5                    0
+3      24        -57.5                  7                    0
+4      25         17.5                  1                    1
+5      26         -7.5                  3                    1
+6      27         55.0                  4                    1
+7      28         22.5                  1                    1
+8      29        -10.0                  4                    1
+9      30         -2.5                  5                    1
+10     31        -52.5                  5                    1
+11     32          0.0                  0                    0
+
+Lucro total agregado: -207.50 pontos (R$ -41.50)
+Negócios fechados: 49
+Taxa de acerto: 18.37%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 49  |  vencedores: 9  |  perdedores: 40
+Ganho médio       : 31.39   |  mediana: 17.50   |  máximo: 112.50
+Perda média       : -12.25   |  mediana: -7.50   |  mínimo: -137.50
+Perda média / Ganho médio: 0.39x
+  percentil  1: -84.70
+  percentil  5: -17.50
+  percentil 25: -12.50
+  percentil 50: -7.50
+  percentil 75: -2.50
+  percentil 95: 22.50
+  percentil 99: 100.50
