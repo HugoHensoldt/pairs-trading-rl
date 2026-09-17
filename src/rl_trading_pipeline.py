@@ -895,6 +895,25 @@ if __name__ == "__main__":
             print(f"{f['fold']} {f['n_chunks_needed']}")
         raise SystemExit(0)
 
+    # Recuperação: roda SÓ a avaliação (val+teste) de um fold já treinado,
+    # carregando o checkpoint salvo em vez de retreinar -- útil quando
+    # run_eval_if_time_allows() pulou uma avaliação por falta de reserva
+    # de tempo (o checkpoint já estava salvo, só o relatório se perdeu).
+    eval_only_fold = os.environ.get("EVAL_ONLY_FOLD")
+    if eval_only_fold:
+        fold_num = int(eval_only_fold)
+        f = next(ff for ff in folds if ff["fold"] == fold_num)
+        train_feats = [build_feature_matrix(process_day(o)) for o in f["train_orders"]]
+        mean, std = fit_feature_scaler(train_feats)
+        model_path = f"ppo_arbitrage_fold{fold_num}.zip"
+        print(f"\n########## FOLD {fold_num} -- AVALIAÇÃO ISOLADA (checkpoint: {model_path}) ##########")
+        model = PPO.load(model_path)
+        print(f"\n=== Fold {fold_num} -- Avaliação em VALIDAÇÃO ===")
+        evaluate_policy(model, f["val_orders"], mean, std)
+        print(f"\n=== Fold {fold_num} -- Avaliação em TESTE ===")
+        evaluate_policy(model, f["test_orders"], mean, std)
+        raise SystemExit(0)
+
     # Sob Slurm job array (--array=1-N_FOLDS), cada task treina só o fold
     # correspondente ao seu índice, em vez de rodar os N_FOLDS em
     # sequência no mesmo job -- assim os folds treinam em paralelo, um
