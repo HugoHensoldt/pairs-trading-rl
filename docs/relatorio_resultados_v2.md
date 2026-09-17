@@ -1,11 +1,15 @@
 # Relatório de Resultados v2 — RL (PPO) para Pairs Trading BOVA11 x WINM21
 
 Segunda rodada completa no Santos Dumont (LNCC), com o **custo de
-transação corrigido** e um **plano de treino em chunks encadeados**
-diferente por fold. Ver [relatorio_resultados.md](relatorio_resultados.md)
-para a rodada anterior (com o bug de custo) — os dois documentos ficam
-separados de propósito, não são comparáveis diretamente ponto a ponto
-(metodologia mudou em vários pontos, ver seção 1).
+transação corrigido desde o treino** e um **plano de treino em chunks
+encadeados** diferente por fold. Ver
+[relatorio_resultados.md](relatorio_resultados.md) para a rodada
+anterior — lá a política ainda foi **treinada** com o custo antigo
+(bugado), e só a avaliação foi corrigida retroativamente depois. Os
+dois documentos ficam separados de propósito, não são comparáveis
+diretamente ponto a ponto (metodologia mudou em vários pontos, ver
+seção 1, e a política do v1 nunca "viu" o custo real durante o
+treino).
 
 ## 0. O que mudou desde a v1
 

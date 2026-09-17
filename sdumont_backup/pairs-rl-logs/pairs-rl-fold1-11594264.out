@@ -1,0 +1,305 @@
+=== Folds walk-forward (TimeSeriesSplit, n_folds=3) ===
+Throughput assumido : 4,209 steps/s  (ajuste para a máquina onde for treinar)
+Orçamento total     : 5.0h somadas entre os 3 folds  ->  25,254,000 timesteps/fold (~1.67h/fold)
+Ticks médios/pregão : 27,662
+Pregões disponíveis : 480  |  pregões usados: 64 (limitado pelo orçamento de tempo)
+  Fold 1: treino=[  1..  7] (  7 dias)  validação=[  8.. 17] ( 10 dias)  teste=[ 18.. 26] (  9 dias)  total_timesteps=25,254,000 (~130.4 passadas/dia de treino)
+  Fold 2: treino=[  1.. 26] ( 26 dias)  validação=[ 27.. 36] ( 10 dias)  teste=[ 37.. 45] (  9 dias)  total_timesteps=25,254,000 (~35.1 passadas/dia de treino)
+  Fold 3: treino=[  1.. 45] ( 45 dias)  validação=[ 46.. 55] ( 10 dias)  teste=[ 56.. 64] (  9 dias)  total_timesteps=25,254,000 (~20.3 passadas/dia de treino)
+
+########## FOLD 1/3 ##########
+Using cpu device
+-------------------------------
+| time/              |        |
+|    fps             | 16497  |
+|    iterations      | 1      |
+|    time_elapsed    | 23     |
+|    total_timesteps | 393216 |
+-------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 10945        |
+|    iterations           | 2            |
+|    time_elapsed         | 71           |
+|    total_timesteps      | 786432       |
+| train/                  |              |
+|    approx_kl            | 0.0121162245 |
+|    clip_fraction        | 0.105        |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -1.09        |
+|    explained_variance   | -0.00106     |
+|    learning_rate        | 0.0003       |
+|    loss                 | 131          |
+|    n_updates            | 10           |
+|    policy_gradient_loss | -0.0118      |
+|    value_loss           | 677          |
+------------------------------------------
+-----------------------------------------
+| rollout/                |             |
+|    ep_len_mean          | 2.42e+04    |
+|    ep_rew_mean          | -5.52e+04   |
+| time/                   |             |
+|    fps                  | 9832        |
+|    iterations           | 3           |
+|    time_elapsed         | 119         |
+|    total_timesteps      | 1179648     |
+| train/                  |             |
+|    approx_kl            | 0.011636317 |
+|    clip_fraction        | 0.155       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.06       |
+|    explained_variance   | 0.0505      |
+|    learning_rate        | 0.0003      |
+|    loss                 | 97.8        |
+|    n_updates            | 20          |
+|    policy_gradient_loss | -0.0179     |
+|    value_loss           | 377         |
+-----------------------------------------
+Eval num_timesteps=1402992, episode_reward=124.50 +/- 113.57
+Episode length: 31607.00 +/- 7165.66
+-----------------------------------------
+| eval/                   |             |
+|    mean_ep_length       | 3.16e+04    |
+|    mean_reward          | 124         |
+| time/                   |             |
+|    total_timesteps      | 1402992     |
+| train/                  |             |
+|    approx_kl            | 0.012985028 |
+|    clip_fraction        | 0.184       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -1.01       |
+|    explained_variance   | 0.0493      |
+|    learning_rate        | 0.0003      |
+|    loss                 | 101         |
+|    n_updates            | 30          |
+|    policy_gradient_loss | -0.0191     |
+|    value_loss           | 284         |
+-----------------------------------------
+New best mean reward!
+----------------------------------
+| rollout/           |           |
+|    ep_len_mean     | 2.75e+04  |
+|    ep_rew_mean     | -6.19e+04 |
+| time/              |           |
+|    fps             | 5253      |
+|    iterations      | 4         |
+|    time_elapsed    | 299       |
+|    total_timesteps | 1572864   |
+----------------------------------
+-----------------------------------------
+| rollout/                |             |
+|    ep_len_mean          | 2.94e+04    |
+|    ep_rew_mean          | -6.5e+04    |
+| time/                   |             |
+|    fps                  | 5662        |
+|    iterations           | 5           |
+|    time_elapsed         | 347         |
+|    total_timesteps      | 1966080     |
+| train/                  |             |
+|    approx_kl            | 0.013774072 |
+|    clip_fraction        | 0.185       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.946      |
+|    explained_variance   | 0.0653      |
+|    learning_rate        | 0.0003      |
+|    loss                 | 99.2        |
+|    n_updates            | 40          |
+|    policy_gradient_loss | -0.0186     |
+|    value_loss           | 248         |
+-----------------------------------------
+-----------------------------------------
+| rollout/                |             |
+|    ep_len_mean          | 3.02e+04    |
+|    ep_rew_mean          | -6.5e+04    |
+| time/                   |             |
+|    fps                  | 5982        |
+|    iterations           | 6           |
+|    time_elapsed         | 394         |
+|    total_timesteps      | 2359296     |
+| train/                  |             |
+|    approx_kl            | 0.014441735 |
+|    clip_fraction        | 0.177       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.853      |
+|    explained_variance   | 0.106       |
+|    learning_rate        | 0.0003      |
+|    loss                 | 89.8        |
+|    n_updates            | 50          |
+|    policy_gradient_loss | -0.0177     |
+|    value_loss           | 203         |
+-----------------------------------------
+----------------------------------------
+| rollout/                |            |
+|    ep_len_mean          | 2.97e+04   |
+|    ep_rew_mean          | -5.84e+04  |
+| time/                   |            |
+|    fps                  | 6237       |
+|    iterations           | 7          |
+|    time_elapsed         | 441        |
+|    total_timesteps      | 2752512    |
+| train/                  |            |
+|    approx_kl            | 0.01340958 |
+|    clip_fraction        | 0.155      |
+|    clip_range           | 0.2        |
+|    entropy_loss         | -0.755     |
+|    explained_variance   | 0.121      |
+|    learning_rate        | 0.0003     |
+|    loss                 | 86.5       |
+|    n_updates            | 60         |
+|    policy_gradient_loss | -0.0152    |
+|    value_loss           | 192        |
+----------------------------------------
+Eval num_timesteps=2805984, episode_reward=256.00 +/- 152.85
+Episode length: 32124.70 +/- 7268.75
+-----------------------------------------
+| eval/                   |             |
+|    mean_ep_length       | 3.21e+04    |
+|    mean_reward          | 256         |
+| time/                   |             |
+|    total_timesteps      | 2805984     |
+| train/                  |             |
+|    approx_kl            | 0.012049455 |
+|    clip_fraction        | 0.129       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.673      |
+|    explained_variance   | 0.207       |
+|    learning_rate        | 0.0003      |
+|    loss                 | 81.6        |
+|    n_updates            | 70          |
+|    policy_gradient_loss | -0.0133     |
+|    value_loss           | 169         |
+-----------------------------------------
+New best mean reward!
+----------------------------------
+| rollout/           |           |
+|    ep_len_mean     | 2.98e+04  |
+|    ep_rew_mean     | -5.23e+04 |
+| time/              |           |
+|    fps             | 5255      |
+|    iterations      | 8         |
+|    time_elapsed    | 598       |
+|    total_timesteps | 3145728   |
+----------------------------------
+------------------------------------------
+| rollout/                |              |
+|    ep_len_mean          | 3.01e+04     |
+|    ep_rew_mean          | -5.06e+04    |
+| time/                   |              |
+|    fps                  | 5477         |
+|    iterations           | 9            |
+|    time_elapsed         | 646          |
+|    total_timesteps      | 3538944      |
+| train/                  |              |
+|    approx_kl            | 0.0105213495 |
+|    clip_fraction        | 0.107        |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.599       |
+|    explained_variance   | 0.317        |
+|    learning_rate        | 0.0003       |
+|    loss                 | 78.6         |
+|    n_updates            | 80           |
+|    policy_gradient_loss | -0.0112      |
+|    value_loss           | 168          |
+------------------------------------------
+-----------------------------------------
+| rollout/                |             |
+|    ep_len_mean          | 3.04e+04    |
+|    ep_rew_mean          | -4.96e+04   |
+| time/                   |             |
+|    fps                  | 5673        |
+|    iterations           | 10          |
+|    time_elapsed         | 693         |
+|    total_timesteps      | 3932160     |
+| train/                  |             |
+|    approx_kl            | 0.009906367 |
+|    clip_fraction        | 0.094       |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.512      |
+|    explained_variance   | 0.311       |
+|    learning_rate        | 0.0003      |
+|    loss                 | 83.3        |
+|    n_updates            | 90          |
+|    policy_gradient_loss | -0.0101     |
+|    value_loss           | 145         |
+-----------------------------------------
+Eval num_timesteps=4208976, episode_reward=378.40 +/- 358.53
+Episode length: 32343.00 +/- 7077.49
+-----------------------------------------
+| eval/                   |             |
+|    mean_ep_length       | 3.23e+04    |
+|    mean_reward          | 378         |
+| time/                   |             |
+|    total_timesteps      | 4208976     |
+| train/                  |             |
+|    approx_kl            | 0.009899191 |
+|    clip_fraction        | 0.0898      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.448      |
+|    explained_variance   | 0.301       |
+|    learning_rate        | 0.0003      |
+|    loss                 | 77.3        |
+|    n_updates            | 100         |
+|    policy_gradient_loss | -0.00868    |
+|    value_loss           | 138         |
+-----------------------------------------
+New best mean reward!
+[TimeLimitCallback] deadline atingido (97s além do limite) -- parando treino com margem de segurança.
+
+=== Fold 1 -- Avaliação em VALIDAÇÃO ===
+   order  lucro_total  negocios_fechados  negocios_vencedores
+0      8        560.0                 90                   49
+1      9        858.0                124                   80
+2     10        398.0                 34                   23
+3     11        525.0                 80                   48
+4     12        497.0                 86                   56
+5     13        577.0                166                   89
+6     14       -251.0                192                   93
+7     15       -451.0                152                   67
+8     16        554.0                 92                   54
+9     17        104.0                112                   62
+
+Lucro total agregado: 3371.00
+Negócios fechados: 1128
+Taxa de acerto: 55.05%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 1128  |  vencedores: 621  |  perdedores: 507
+Ganho médio       : 20.89   |  mediana: 19.50   |  máximo: 104.50
+Perda média       : -18.95   |  mediana: -10.50   |  mínimo: -105.50
+Perda média / Ganho médio: 0.91x
+  percentil  1: -69.15
+  percentil  5: -45.50
+  percentil 25: -10.50
+  percentil 50: 4.50
+  percentil 75: 19.50
+  percentil 95: 39.50
+  percentil 99: 59.50
+
+=== Fold 1 -- Avaliação em TESTE ===
+   order  lucro_total  negocios_fechados  negocios_vencedores
+0     18        795.5                309                  155
+1     19       -216.5                123                   58
+2     20       -293.5                 67                   29
+3     21       -350.0                 70                   26
+4     22        257.0                 76                   36
+5     23        599.0                 62                   44
+6     24        304.5                 61                   23
+7     25        250.0                 70                   36
+8     26         71.0                138                   65
+
+Lucro total agregado: 1417.00
+Negócios fechados: 976
+Taxa de acerto: 48.36%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 976  |  vencedores: 472  |  perdedores: 504
+Ganho médio       : 22.03   |  mediana: 14.50   |  máximo: 419.50
+Perda média       : -17.83   |  mediana: -10.50   |  mínimo: -165.50
+Perda média / Ganho médio: 0.81x
+  percentil  1: -80.50
+  percentil  5: -45.50
+  percentil 25: -10.50
+  percentil 50: -0.50
+  percentil 75: 14.50
+  percentil 95: 39.50
+  percentil 99: 79.50

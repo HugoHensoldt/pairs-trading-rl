@@ -1,9 +1,10 @@
-# Relatório de Resultados (versão anterior, com bug de custo fixo) — RL (PPO) para Pairs Trading BOVA11 x WINM21
+# Relatório de Resultados (versão anterior — política treinada com custo de 0,5 pontos; avaliação corrigida para 2,5 pontos) — RL (PPO) para Pairs Trading BOVA11 x WINM21
 
 Walk-forward com 3 folds, treinado no Santos Dumont (LNCC).
 
 > Ver [relatorio_resultados_v2.md](relatorio_resultados_v2.md) para a
-> rodada seguinte, com o custo de transação corrigido.
+> rodada seguinte, com o custo de transação corrigido **desde o
+> treino** (não só na avaliação, como aqui — ver nota da seção 2).
 
 ## 1. Metodologia
 
@@ -49,18 +50,45 @@ fechamento — de propósito, para não penalizar adicionalmente a decisão
 de realizar uma posição perdedora). No fim do pregão, qualquer posição
 aberta é fechada automaticamente.
 
-> **Nota sobre unidades (adicionada após revisão):** toda a recompensa,
-> P&L e "Lucro total" deste relatório estão em **PONTOS do WIN**, não em
-> R$ — o ambiente (`ArbitrageTradingEnv`) opera inteiramente em pontos
-> brutos, sem nenhuma conversão para R$ internamente. Para converter
-> qualquer valor deste relatório para R$, multiplique por **0,20**
-> (1 ponto do WIN = R$0,20). A taxa fixa de corretora correta é de
-> **2.5 pontos** (== R$0,50 por negociação completa, o custo real
-> informado). A rodada usada para gerar os resultados abaixo foi
-> treinada com a taxa fixa antiga, de **0.5 pontos** (== R$0,10) — 5x
-> menor que o valor correto — então os números desta seção não refletem
-> o custo de transação real e uma nova rodada de treino/avaliação é
-> necessária para números corretos.
+> **Nota sobre unidades e custo de transação (atualizada):** toda a
+> recompensa, P&L e "Lucro total" deste relatório estão em **PONTOS do
+> WIN**, não em R$ — o ambiente (`ArbitrageTradingEnv`) opera
+> inteiramente em pontos brutos, sem nenhuma conversão para R$
+> internamente. Para converter qualquer valor deste relatório para R$,
+> multiplique por **0,20** (1 ponto do WIN = R$0,20).
+>
+> A política avaliada nas seções 4 e 5 foi **treinada** com a taxa fixa
+> de corretora antiga e incorreta, de **0,5 pontos** (== R$0,10) por
+> negociação — 5x menor que o valor real de **2,5 pontos** (==
+> R$0,50). Os números das seções 4 e 5, porém, já foram **corrigidos
+> retroativamente** para refletir a taxa correta: como a taxa é
+> cobrada como um valor fixo por negociação completa (uma vez na
+> abertura, não dividida no fechamento — ver "Função de recompensa"
+> acima), a correção equivale a subtrair **2,0 pontos adicionais por
+> negociação** (a diferença entre 2,5 e 0,5) de cada negócio.
+>
+> Essa correção é **exata** para "Lucro total", "Lucro médio/negócio" e
+> para os percentis P5/P50 (mediana)/P95 da distribuição de P&L por
+> negócio — um deslocamento constante desloca a soma, a média e
+> qualquer percentil pelo mesmo valor, não importa o formato da
+> distribuição. Ela **não é exata** para "Taxa de acerto", "Ganho
+> médio" e "Perda média" (marcados com `*` abaixo): o deslocamento pode
+> empurrar negócios que antes eram pequenos ganhos brutos (entre 0 e
+> 2,0 pontos) para o lado de perda, e recalcular esses três campos
+> corretamente exigiria os dados de P&L por negociação individual, que
+> não foram retidos desta rodada. Eles permanecem com os valores
+> **originais (custo de 0,5), não corrigidos** — na prática, a taxa de
+> acerto real após a correção é igual ou **menor** que a mostrada, nunca
+> maior.
+>
+> Importante: esta é uma correção da **contabilidade da avaliação**,
+> não um retreino — a política em si ainda foi treinada sob o custo
+> antigo (mais barato) e aprendeu um comportamento de negociação
+> calibrado pra custos 5x menores que os reais. Os números abaixo
+> mostram quanto essa mesma política (não recalibrada) teria
+> ganho/perdido sob o custo real, e não o resultado de uma política
+> treinada já com o custo real — isso é o que a rodada v2 faz (ver
+> [relatorio_resultados_v2.md](relatorio_resultados_v2.md)).
 
 **PPO — hiperparâmetros:**
 
@@ -89,47 +117,78 @@ seu próprio valor inicial de `ep_rew_mean` dentro do orçamento de
 timesteps usado — sinal de que o treino provavelmente se beneficiaria
 de mais timesteps/tempo de treino do que o orçamento atual permite.
 
+> **Nota:** diferente das tabelas da seção 4, esta curva **não** foi
+> (nem pode ser) corrigida para o custo de 2,5 pontos — ela é telemetria
+> real do treino (`ep_rew_mean` agregado por episódio, logado pelo
+> stable-baselines3), não uma contagem de negócios por ponto, então o
+> deslocamento constante de -2,0/negócio usado na seção 4 não se aplica
+> aqui de forma exata. A política que gerou esta curva foi de fato
+> treinada sob o custo antigo (0,5).
+
 ## 4. Resultados de avaliação
 
 *(valores em **pontos do WIN**, não R$ — ver nota de unidades na seção 2;
-multiplique por 0,20 para converter para R$)*
+multiplique por 0,20 para converter para R$. Custo de transação
+corrigido retroativamente para 2,5 pontos/negócio — ver nota da seção
+2 sobre o que é exato e o que não é nesta correção)*
 
-| Fold | Conjunto | Lucro total | Taxa de acerto | Negócios | Lucro médio/negócio |
+| Fold | Conjunto | Lucro total | Taxa de acerto* | Negócios | Lucro médio/negócio |
 |---|---|---|---|---|---|
-| 1 | Validação | 2.291,0 | 56,1% | 578 | 3,96 |
-| 1 | Teste | -953,0 | 45,2% | 496 | -1,92 |
-| 2 | Validação | 535,5 | 53,6% | 649 | 0,82 |
-| 2 | Teste | 1.276,0 | 51,3% | 838 | 1,52 |
-| 3 | Validação | 3.551,5 | 47,7% | 1.657 | 2,14 |
-| 3 | Teste | 6.597,0 | 49,4% | 1.196 | 5,52 |
+| 1 | Validação | 1.135,0 | 56,1%* | 578 | 1,96 |
+| 1 | Teste | -1.945,0 | 45,2%* | 496 | -3,92 |
+| 2 | Validação | -762,5 | 53,6%* | 649 | -1,17 |
+| 2 | Teste | -400,0 | 51,3%* | 838 | -0,48 |
+| 3 | Validação | 237,5 | 47,7%* | 1.657 | 0,14 |
+| 3 | Teste | 4.205,0 | 49,4%* | 1.196 | 3,52 |
+
+*\* Taxa de acerto não recalculada — valor original com custo de 0,5,
+ver nota da seção 2 (o valor real após a correção é igual ou menor).*
 
 ### Distribuição de P&L por negócio (líquida de custos)
 
-| Fold | Conjunto | Ganho médio | Perda média | Perda/Ganho | P5 | P50 (mediana) | P95 |
+| Fold | Conjunto | Ganho médio* | Perda média* | Perda/Ganho* | P5 | P50 (mediana) | P95 |
 |---|---|---|---|---|---|---|---|
-| 1 | Validação | 28,73 | -27,63 | 0,96x | -60,50 | 7,00 | 54,50 |
-| 1 | Teste | 27,67 | -26,35 | 0,95x | -60,50 | -0,50 | 49,50 |
-| 2 | Validação | 22,04 | -23,71 | 1,08x | -60,50 | 4,50 | 44,50 |
-| 2 | Teste | 23,38 | -21,52 | 0,92x | -56,25 | 4,50 | 44,50 |
-| 3 | Validação | 26,33 | -19,95 | 0,76x | -50,50 | -0,50 | 50,50 |
-| 3 | Teste | 27,85 | -16,30 | 0,59x | -40,50 | -0,50 | 54,50 |
+| 1 | Validação | 28,73 | -27,63 | 0,96x | -62,50 | 5,00 | 52,50 |
+| 1 | Teste | 27,67 | -26,35 | 0,95x | -62,50 | -2,50 | 47,50 |
+| 2 | Validação | 22,04 | -23,71 | 1,08x | -62,50 | 2,50 | 42,50 |
+| 2 | Teste | 23,38 | -21,52 | 0,92x | -58,25 | 2,50 | 42,50 |
+| 3 | Validação | 26,33 | -19,95 | 0,76x | -52,50 | -2,50 | 48,50 |
+| 3 | Teste | 27,85 | -16,30 | 0,59x | -42,50 | -2,50 | 52,50 |
+
+*\* Ganho médio, Perda média e Perda/Ganho não recalculados — valores
+originais com custo de 0,5, ver nota da seção 2. P5/P50/P95 já estão
+corrigidos (deslocamento de -2,0 pontos, exato).*
 
 ## 5. Observações
 
-- **Taxa de acerto sempre próxima ou abaixo de 50%** em todos os
-  folds/conjuntos — quando há lucro, ele vem do tamanho médio do ganho
-  superar o da perda (razão perda/ganho entre 0,59x e 1,08x), não de
-  acertar a maioria das operações.
-- **Fold 1 teve teste negativo** (-953,0; -1,92/negócio) mesmo com
-  validação positiva — é também o fold com menos dias de treino (7),
-  consistente com uma hipótese de overfitting à janela de validação
-  nesse fold específico.
-- **Fold 3 negocia muito mais** (1.657 + 1.196 = 2.853 negócios) que o
-  Fold 1 (578 + 496 = 1.074) nos mesmos ~19 dias de val+teste — mas
-  também é o fold com o melhor lucro médio por negócio no teste
-  (5,52), então o volume maior de negociação não parece estar vindo de
-  overtrading improdutivo, pelo menos nesse conjunto.
-- **A curva de treino em "U" sem recuperação total** (seção 3) sugere
-  que o orçamento de timesteps atual pode estar interrompendo o treino
+- **Com o custo corrigido (2,5 pontos), a imagem muda bastante.** Com o
+  custo antigo (0,5), 5 dos 6 pares fold/conjunto eram positivos; após
+  a correção, só 3 continuam positivos (Fold 1 validação: +1.135,0;
+  Fold 3 validação: +237,5, praticamente zero; Fold 3 teste: +4.205,0)
+  e 3 passam a negativos (Fold 1 teste: -1.945,0; Fold 2 validação:
+  -762,5; Fold 2 teste: -400,0).
+- **Fold 2 inverte de sinal nos dois conjuntos.** Antes parecia positivo
+  tanto em validação (535,5) quanto em teste (1.276,0); depois da
+  correção, os dois ficam negativos (-762,5 e -400,0) — o volume de
+  negócios do fold 2 (649 + 838 = 1.487) era alto o bastante para que
+  os 2,0 pontos extras por negociação superassem o lucro bruto.
+- **Fold 3 teste continua o resultado mais forte** mesmo após a
+  correção (+4.205,0; +3,52/negócio) — também era, com folga, o
+  conjunto de melhor lucro médio bruto por negócio antes da correção
+  (5,52), então tinha mais margem para absorver o custo extra.
+- **O volume de negócios, não só o lucro bruto por negócio, determina o
+  tamanho da correção** — folds/conjuntos com muitas negociações
+  pequenas são desproporcionalmente penalizados pelo custo real. Esse
+  padrão se confirma de forma ainda mais extrema na v2, onde o
+  overfitting gerado por `target_n_passadas` alto levou a volumes de
+  milhares de negócios/fold e perdas líquidas muito maiores (ver
+  [relatorio_resultados_v2.md](relatorio_resultados_v2.md)).
+- **Taxa de acerto, ganho médio e perda média não foram recalculados
+  com exatidão** (ver nota da seção 2) — os valores mostrados ainda são
+  os originais (custo de 0,5) e tendem a estar levemente otimistas: a
+  taxa de acerto real após a correção é igual ou menor que a mostrada.
+- **A curva de treino em "U" sem recuperação total** (seção 3, não
+  corrigida — telemetria real do treino sob o custo antigo) sugere que
+  o orçamento de timesteps atual pode estar interrompendo o treino
   antes da política convergir — um próximo passo natural seria testar
   com mais timesteps/tempo de treino por fold.

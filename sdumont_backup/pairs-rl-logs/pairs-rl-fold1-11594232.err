@@ -1,0 +1,5 @@
+/scratch/ppg-lncc/hugo.hensoldt/envs/pairs-rl/lib/python3.10/site-packages/stable_baselines3/common/callbacks.py:419: UserWarning: Training and eval env are not of the same type<stable_baselines3.common.vec_env.subproc_vec_env.SubprocVecEnv object at 0x14a4fdeee980> != <stable_baselines3.common.vec_env.dummy_vec_env.DummyVecEnv object at 0x14a4e4b269b0>
+  warnings.warn("Training and eval env are not of the same type" f"{self.training_env} != {self.eval_env}")
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 11594232 ON sdumont6165 CANCELLED AT 2026-09-14T16:18:38 DUE TO TIME LIMIT ***
+slurmstepd: error: *** STEP 11594232.0 ON sdumont6165 CANCELLED AT 2026-09-14T16:18:38 DUE TO TIME LIMIT ***
