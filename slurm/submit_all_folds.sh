@@ -11,7 +11,7 @@
 #   bash slurm/submit_all_folds.sh
 set -euo pipefail
 
-N_FOLDS=3  # mesmo N_FOLDS de src/rl_trading_pipeline.py -- ajuste junto se mudar lá
+N_FOLDS=6  # mesmo N_FOLDS de src/rl_trading_pipeline.py -- ajuste junto se mudar lá
 
 cd "$(dirname "$0")/.."
 

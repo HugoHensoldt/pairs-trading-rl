@@ -846,9 +846,23 @@ def evaluate_policy(model, orders, mean, std, n_ticks=120):
 if __name__ == "__main__":
     all_orders = list(range(1, 481))  # 480 pregões disponíveis, em ordem cronológica
 
-    N_FOLDS = 3  # configurável: quantos folds walk-forward gerar
+    N_FOLDS = 6  # era 3 -- estendendo o walk-forward pra mais folds
 
-    folds = generate_walk_forward_folds(all_orders, n_folds=N_FOLDS)
+    # time_budget_hours escalado (era 5.0 pro default de 3 folds) pra
+    # manter os folds em escala comparável à rodada original -- NÃO é o
+    # tempo real de treino (isso continua limitado pelo TRAIN_MAX_SECONDS
+    # do .sbatch), só dimensiona quantos dias cada fold usa.
+    #
+    # Limitação descoberta ao estender: com train_frac=70%/val+teste=30%
+    # (abaixo), QUALQUER n_folds > 3 força o fold 1 a ficar com só 1 dia
+    # de treino, não importa o time_budget_hours -- é uma consequência
+    # matemática da proporção 70/30 (o TimeSeriesSplit precisa de
+    # n_folds*test_size+1 pregões no mínimo, e com essa proporção isso
+    # sempre excede max_train_days+test_size antes de n_folds=4). Os
+    # folds 2-6 continuam crescendo normalmente e de forma saudável --
+    # só o fold 1 deve ser tratado como "aquecimento" descartável,
+    # ignorar os números dele nos relatórios/conclusões.
+    folds = generate_walk_forward_folds(all_orders, n_folds=N_FOLDS, time_budget_hours=10.0)
 
     # Sob Slurm job array (--array=1-N_FOLDS), cada task treina só o fold
     # correspondente ao seu índice, em vez de rodar os N_FOLDS em
