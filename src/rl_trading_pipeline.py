@@ -683,6 +683,85 @@ def generate_walk_forward_folds(
     return folds
 
 
+def extend_walk_forward_folds(
+    all_orders,
+    n_folds,
+    baseline_n_folds=3,
+    baseline_max_train_days=45,
+    val_size=10,
+    test_size_only=9,
+    throughput_steps_per_sec=4209.0,
+    time_budget_hours=5.0,
+    verbose=True,
+):
+    """Estende o walk-forward original (n_folds=3, treino=[7,26,45] dias,
+    validação=10 dias, teste=9 dias -- a rodada validada no Santos
+    Dumont) para mais folds, SEM recalcular os já existentes.
+
+    `generate_walk_forward_folds()` usa TimeSeriesSplit ancorado no FIM
+    do conjunto de dados -- aumentar n_folds ali recalcula TODOS os
+    limites (inclusive o fold 1, que degrada pra ~1 dia de treino com
+    train_frac=70%/n_folds>3). Esta função faz o oposto: mantém os
+    folds 1..baseline_n_folds idênticos à rodada original e ACRESCENTA
+    fold baseline_n_folds+1, +2, ... depois, cada um somando mais um
+    bloco de `val_size+test_size_only` dias de treino -- exatamente como
+    o walk-forward já cresce entre os folds originais.
+
+    `baseline_max_train_days`/`val_size`/`test_size_only` são os valores
+    reais que `generate_walk_forward_folds(all_orders, n_folds=3)`
+    produziu (fold 3: 45 dias treino, 10 validação, 9 teste) -- não são
+    recalculados aqui de propósito, pra reproduzir bit a bit a rodada
+    original em vez de derivar de novo.
+    """
+    test_size = val_size + test_size_only
+    budget_seconds_per_fold = (time_budget_hours * 3600.0) / baseline_n_folds
+    total_timesteps_fold = int(throughput_steps_per_sec * budget_seconds_per_fold)
+
+    avg_ticks_per_day = float(np.mean([len(process_day(o)) for o in all_orders[:2]]))
+
+    folds = []
+    for i in range(1, n_folds + 1):
+        train_end = baseline_max_train_days + (i - baseline_n_folds) * test_size
+        assert train_end >= 1, f"fold {i} ficaria com menos de 1 dia de treino"
+        val_start = train_end + 1
+        val_end = val_start + val_size - 1
+        test_start = val_end + 1
+        test_end = test_start + test_size_only - 1
+        assert test_end <= len(all_orders), \
+            f"fold {i} precisa do pregão {test_end}, só há {len(all_orders)} disponíveis"
+
+        train_orders = list(range(1, train_end + 1))
+        val_orders = list(range(val_start, val_end + 1))
+        test_orders = list(range(test_start, test_end + 1))
+
+        n_passadas_medias = total_timesteps_fold / (len(train_orders) * avg_ticks_per_day)
+        folds.append({
+            "fold": i,
+            "train_orders": train_orders,
+            "val_orders": val_orders,
+            "test_orders": test_orders,
+            "total_timesteps": total_timesteps_fold,
+            "n_passadas_medias": n_passadas_medias,
+        })
+
+    if verbose:
+        print(f"=== Folds walk-forward ESTENDIDOS (base: n_folds={baseline_n_folds}, "
+              f"fold {baseline_n_folds}={baseline_max_train_days} dias treino) ===")
+        print(f"Ticks médios/pregão : {avg_ticks_per_day:,.0f}")
+        print(f"Pregões disponíveis : {len(all_orders)}  |  pregões usados: {folds[-1]['test_orders'][-1]}")
+        for f in folds:
+            tr, va, te = f["train_orders"], f["val_orders"], f["test_orders"]
+            assert tr[-1] < va[0] <= va[-1] < te[0] <= te[-1], \
+                "sobreposição/ordem cronológica violada entre treino/validação/teste"
+            print(f"  Fold {f['fold']}: treino=[{tr[0]:>3}..{tr[-1]:>3}] ({len(tr):>3} dias)  "
+                  f"validação=[{va[0]:>3}..{va[-1]:>3}] ({len(va):>3} dias)  "
+                  f"teste=[{te[0]:>3}..{te[-1]:>3}] ({len(te):>3} dias)  "
+                  f"total_timesteps={f['total_timesteps']:,} "
+                  f"(~{f['n_passadas_medias']:.1f} passadas/dia de treino)")
+
+    return folds
+
+
 # --------------------------------------------------------------------------
 # 5) TREINO (PPO)
 # --------------------------------------------------------------------------
@@ -848,21 +927,17 @@ if __name__ == "__main__":
 
     N_FOLDS = 6  # era 3 -- estendendo o walk-forward pra mais folds
 
-    # time_budget_hours escalado (era 5.0 pro default de 3 folds) pra
-    # manter os folds em escala comparável à rodada original -- NÃO é o
-    # tempo real de treino (isso continua limitado pelo TRAIN_MAX_SECONDS
-    # do .sbatch), só dimensiona quantos dias cada fold usa.
-    #
-    # Limitação descoberta ao estender: com train_frac=70%/val+teste=30%
-    # (abaixo), QUALQUER n_folds > 3 força o fold 1 a ficar com só 1 dia
-    # de treino, não importa o time_budget_hours -- é uma consequência
-    # matemática da proporção 70/30 (o TimeSeriesSplit precisa de
-    # n_folds*test_size+1 pregões no mínimo, e com essa proporção isso
-    # sempre excede max_train_days+test_size antes de n_folds=4). Os
-    # folds 2-6 continuam crescendo normalmente e de forma saudável --
-    # só o fold 1 deve ser tratado como "aquecimento" descartável,
-    # ignorar os números dele nos relatórios/conclusões.
-    folds = generate_walk_forward_folds(all_orders, n_folds=N_FOLDS, time_budget_hours=10.0)
+    # extend_walk_forward_folds() (não generate_walk_forward_folds())
+    # de propósito: preserva os folds 1/2/3 EXATAMENTE como na rodada
+    # original (7/26/45 dias de treino, 10 validação, 9 teste) e só
+    # ACRESCENTA os folds 4/5/6 depois (64/83/102 dias) -- deixar o
+    # generate_walk_forward_folds() recalcular tudo via TimeSeriesSplit
+    # com n_folds=6 degrada o fold 1 pra 1 dia de treino só (testado,
+    # ver histórico do branch), porque train_frac=70% não sustenta mais
+    # de 3 folds sem esse efeito. Os defaults desta função já reproduzem
+    # a rodada original (baseline_max_train_days=45, val_size=10,
+    # test_size_only=9, mesmo throughput/time_budget_hours).
+    folds = extend_walk_forward_folds(all_orders, n_folds=N_FOLDS)
 
     # Sob Slurm job array (--array=1-N_FOLDS), cada task treina só o fold
     # correspondente ao seu índice, em vez de rodar os N_FOLDS em
