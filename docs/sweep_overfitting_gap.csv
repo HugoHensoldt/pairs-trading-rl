@@ -1,0 +1,6 @@
+run_tag,target_n_passadas,fold,gap
+p1,1.0,1,
+p10,10.0,1,
+p20,20.0,1,
+p3,3.0,1,
+p5,5.0,1,

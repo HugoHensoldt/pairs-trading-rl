@@ -1,0 +1,116 @@
+RUN_TAG=p1  CHUNK_INDEX=1
+=== Folds walk-forward (TimeSeriesSplit, n_folds=3) ===
+Throughput assumido : 4,209 steps/s  (ajuste para a máquina onde for treinar)
+Passadas-alvo/dia   : 1.0 (igual para todos os folds)
+Chunk (job Slurm)   : 1140s de treino real por job encadeado
+Ticks médios/pregão : 27,662
+Pregões disponíveis : 80  |  pregões usados: 80
+  Fold 1: treino=[  1..  8] (  8 dias)  validação=[  9.. 20] ( 12 dias)  teste=[ 21.. 32] ( 12 dias)  total_timesteps=221,296 (~1.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+  Fold 2: treino=[  1.. 32] ( 32 dias)  validação=[ 33.. 44] ( 12 dias)  teste=[ 45.. 56] ( 12 dias)  total_timesteps=885,184 (~1.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+  Fold 3: treino=[  1.. 56] ( 56 dias)  validação=[ 57.. 68] ( 12 dias)  teste=[ 69.. 80] ( 12 dias)  total_timesteps=1,549,072 (~1.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+
+########## FOLD 1/3 ##########
+Using cpu device
+Logging to logs/p1/fold1/chunk1
+Eval num_timesteps=12288, episode_reward=-52158.75 +/- 10518.08
+Episode length: 32074.33 +/- 5353.04
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.21e+04  |
+|    mean_reward     | -5.22e+04 |
+| time/              |           |
+|    total_timesteps | 12288     |
+----------------------------------
+New best mean reward!
+Eval num_timesteps=24576, episode_reward=-55257.50 +/- 11560.98
+Episode length: 33880.83 +/- 6483.13
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.39e+04  |
+|    mean_reward     | -5.53e+04 |
+| time/              |           |
+|    total_timesteps | 24576     |
+----------------------------------
+Eval num_timesteps=36864, episode_reward=-56924.58 +/- 7793.87
+Episode length: 34248.08 +/- 4534.78
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.42e+04  |
+|    mean_reward     | -5.69e+04 |
+| time/              |           |
+|    total_timesteps | 36864     |
+----------------------------------
+Eval num_timesteps=49152, episode_reward=-53692.50 +/- 11553.51
+Episode length: 32704.58 +/- 5973.14
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.27e+04  |
+|    mean_reward     | -5.37e+04 |
+| time/              |           |
+|    total_timesteps | 49152     |
+----------------------------------
+[TimeLimitCallback] deadline atingido (8s além do limite) -- parando treino com margem de segurança.
+
+=== Fold 1 -- Avaliação em VALIDAÇÃO ===
+    order  lucro_total  negocios_fechados  negocios_vencedores
+0       9     -56907.5               7577                  881
+1      10     -35327.5               4797                  388
+2      11     -42192.5               5799                  602
+3      12     -59407.5               7985                  860
+4      13     -64482.5               8625                 1047
+5      14     -66905.0               8952                 1240
+6      15     -53995.0               7210                  943
+7      16     -53867.5               7469                  844
+8      17     -54452.5               7279                  890
+9      18     -65897.5               8985                 1389
+10     19     -43070.0               5744                  689
+11     20     -29285.0               3944                  373
+
+Lucro total agregado: -625790.00 pontos (R$ -125158.00)
+Negócios fechados: 84366
+Taxa de acerto: 12.03%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 84366  |  vencedores: 10146  |  perdedores: 74220
+Ganho médio       : 6.60   |  mediana: 2.50   |  máximo: 187.50
+Perda média       : -9.33   |  mediana: -7.50   |  mínimo: -122.50
+Perda média / Ganho médio: 1.41x
+  percentil  1: -32.50
+  percentil  5: -17.50
+  percentil 25: -12.50
+  percentil 50: -7.50
+  percentil 75: -2.50
+  percentil 95: 2.50
+  percentil 99: 17.50
+
+=== Fold 1 -- Avaliação em TESTE ===
+    order  lucro_total  negocios_fechados  negocios_vencedores
+0      21     -24882.5               3421                  349
+1      22     -46185.0               6162                  550
+2      23     -35235.0               4882                  550
+3      24     -11070.0               1492                  183
+4      25     -28207.5               3749                  349
+5      26     -32802.5               3923                  265
+6      27     -37855.0               4972                  400
+7      28     -34672.5               4709                  433
+8      29     -31637.5               4311                  544
+9      30     -24632.5               3329                  428
+10     31     -36867.5               4911                  585
+11     32     -36827.5               4933                  713
+
+Lucro total agregado: -380875.00 pontos (R$ -76175.00)
+Negócios fechados: 50794
+Taxa de acerto: 10.53%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 50794  |  vencedores: 5349  |  perdedores: 45445
+Ganho médio       : 6.54   |  mediana: 2.50   |  máximo: 122.50
+Perda média       : -9.15   |  mediana: -7.50   |  mínimo: -177.50
+Perda média / Ganho médio: 1.40x
+  percentil  1: -32.50
+  percentil  5: -17.50
+  percentil 25: -12.50
+  percentil 50: -7.50
+  percentil 75: -2.50
+  percentil 95: 2.50
+  percentil 99: 12.50

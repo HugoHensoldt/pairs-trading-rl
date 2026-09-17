@@ -207,8 +207,12 @@ def load_progress_csv(logs_root: Path, run_tag: str, fold: int) -> pd.DataFrame:
 def plot_train_vs_val(df: pd.DataFrame, run_tag: str, target_n_passadas, out_path: Path):
     import matplotlib.pyplot as plt
 
-    train = df[["time/total_timesteps", "rollout/ep_rew_mean"]].dropna()
-    val = df[["time/total_timesteps", "eval/mean_reward"]].dropna()
+    # reindex (não indexação direta): se o treino foi curto demais pra
+    # completar 1 rollout, a coluna "rollout/ep_rew_mean" nem chega a
+    # existir no CSV (não é só NaN) -- reindex preenche com NaN em vez
+    # de estourar KeyError, e o dropna() abaixo já trata esse caso.
+    train = df.reindex(columns=["time/total_timesteps", "rollout/ep_rew_mean"]).dropna()
+    val = df.reindex(columns=["time/total_timesteps", "eval/mean_reward"]).dropna()
     if train.empty and val.empty:
         print(f"[aviso] {run_tag}: progress.csv sem rollout/ep_rew_mean nem "
               f"eval/mean_reward -- nada pra plotar (treino provavelmente "
@@ -239,8 +243,8 @@ def compute_overfitting_gap(df: pd.DataFrame, n_last=5):
     """gap = ep_rew_mean (treino, ponto de rollout mais recente até ali) -
     eval/mean_reward (validação), média dos últimos `n_last` pontos de
     avaliação -- métrica-resumo pedida: distância entre as duas curvas."""
-    train = df[["time/total_timesteps", "rollout/ep_rew_mean"]].dropna()
-    val = df[["time/total_timesteps", "eval/mean_reward"]].dropna()
+    train = df.reindex(columns=["time/total_timesteps", "rollout/ep_rew_mean"]).dropna()
+    val = df.reindex(columns=["time/total_timesteps", "eval/mean_reward"]).dropna()
     if train.empty or val.empty:
         return np.nan
     merged = pd.merge_asof(

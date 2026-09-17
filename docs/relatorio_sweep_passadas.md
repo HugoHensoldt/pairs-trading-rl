@@ -1,10 +1,10 @@
 # Sweep de `target_n_passadas` (fold 1) — RL (PPO) para Pairs Trading BOVA11 x WINM21
 
-> **Status: aguardando execução no Santos Dumont.** Este documento é um
-> esqueleto — a infraestrutura (código + scripts Slurm) já está pronta e
-> validada localmente (ver seção 1), mas os números das seções 3 e 4 só
-> existem depois que `slurm/submit_sweep.sh` rodar no cluster e
-> `src/analyze_sweep.py` processar os logs trazidos de volta.
+> **Status: executado.** Rodada completa no Santos Dumont em 17/09/2026
+> (13:11-14:42, 5 jobs sequenciais). **Resultado principal: o sweep
+> CONTRADIZ a hipótese da v2** (seção 0) — dentro do fold 1, MENOS
+> passadas não reduziu o problema, produziu um resultado muito PIOR.
+> Ver seção 5.
 
 ## 0. Motivação
 
@@ -97,21 +97,98 @@ de transação, hiperparâmetros PPO).
 
 ## 3. Resultados de avaliação
 
-*(preencher com `docs/sweep_resultados.md`, gerado por
-`src/analyze_sweep.py` depois da rodada no cluster)*
+*(valores em pontos do WIN; multiplique por 0,20 para R$)*
+
+| `target_n_passadas` | Conjunto | Lucro total | Taxa de acerto | Negócios | Lucro médio/negócio |
+|---|---|---|---|---|---|
+| 1 | Validação | -625.790,0 pts (R$ -125.158,00) | 12,0% | 84.366 | -7,42 |
+| 1 | Teste | -380.875,0 pts (R$ -76.175,00) | 10,5% | 50.794 | -7,50 |
+| 3 | Validação | -803.782,5 pts (R$ -160.756,50) | 10,3% | 102.423 | -7,85 |
+| 3 | Teste | *(pulado — ver nota abaixo)* | — | — | — |
+| 5 | Validação | -757.107,5 pts (R$ -151.421,50) | 10,9% | 96.616 | -7,84 |
+| 5 | Teste | -440.745,0 pts (R$ -88.149,00) | 10,2% | 57.090 | -7,72 |
+| 10 | Validação | -6.822,5 pts (R$ -1.364,50) | 19,6% | 1.185 | -5,76 |
+| 10 | Teste | -3.935,0 pts (R$ -787,00) | 18,3% | 678 | -5,80 |
+| 20 | Validação | 505,0 pts (R$ 101,00) | 50,0% | 36 | 14,03 |
+| 20 | Teste | 160,0 pts (R$ 32,00) | 44,1% | 34 | 4,71 |
+
+*Nota: o teste de `passadas=3` foi pulado pelo mesmo mecanismo de
+reserva de tempo da v2 (`121s restantes, menos que a reserva de 150s`)
+— o checkpoint está salvo (`ppo_arbitrage_fold1_p3.zip`), recuperável
+com `EVAL_ONLY_FOLD` se precisar do número exato; dado o padrão dos
+vizinhos (p1 e p5 também catastróficos), não deve mudar a leitura.*
+
+Note a escala: **84 mil a 102 mil negócios** em 12 dias de validação
+(≈7-8 mil/dia) para passadas ≤5 — a política não aprendeu nada
+utilizável, está essencialmente entrando/saindo de posição a cada
+poucos ticks. Em `passadas=10` isso já cai pra ~100/dia, e em
+`passadas=20` pra ~3/dia (comparável a um trader discricionário).
 
 ## 4. Curvas de treino vs. validação — gap de overfitting
 
-*(preencher com `docs/img/sweep_p<N>.png` por valor de
-`target_n_passadas`, e o gráfico-resumo
-`docs/img/sweep_overfitting_gap.png` — gap = `ep_rew_mean` de treino
-menos `eval/mean_reward` de validação, média dos últimos 5 pontos de
-avaliação, no eixo `target_n_passadas`)*
+![target_n_passadas=1](img/sweep_p1.png)
+![target_n_passadas=3](img/sweep_p3.png)
+![target_n_passadas=5](img/sweep_p5.png)
+![target_n_passadas=10](img/sweep_p10.png)
+![target_n_passadas=20](img/sweep_p20.png)
+
+Em `passadas=1` a validação fica achatada entre -52.000 e -57.000 do
+início ao fim — nenhum aprendizado visível. `passadas=10` mostra uma
+transição abrupta: estável por ~370k timesteps em torno de -60.000/
+-70.000, e então salta pra perto de 0 nos últimos pontos. `passadas=20`
+mostra a mesma subida, começando de um ponto melhor (-47.000) e
+terminando bem perto de 0. **Padrão consistente**: existe algo como uma
+transição de fase — a política fica "destreinada" (efetivamente
+aleatória, com custo de transação dominando) até um certo número de
+updates PPO, e só depois disso aprende a operar com parcimônia.
+
+**Gráfico-resumo (`sweep_overfitting_gap.png`) não foi gerado**: o
+cálculo do gap (`compute_overfitting_gap`) faz um merge "backward" do
+ponto de treino (`rollout/ep_rew_mean`) mais recente contra cada ponto
+de validação -- mas em `passadas=20` (o único caso com pelo menos 1
+ponto de treino completo, ver seção 1) esse único ponto de treino cai
+DEPOIS do último ponto de validação no eixo de timesteps (comparar
+`sweep_p20.png`: o ponto azul solto fica à direita de toda a curva
+vermelha) -- não há nenhum ponto de validação "anterior" a ele pra
+comparar, e o merge fica vazio. Não é um bug no sentido de dar número
+errado -- é a limitação real do desenho do log (só 1 rollout completo
+disponível) tornando essa métrica específica não-computável aqui. As
+curvas brutas acima (seção 4) já mostram a mesma informação
+qualitativa sem depender dela.
 
 ## 5. Observações
 
-*(preencher depois dos resultados — em particular: o gap de overfitting
-cresce com `target_n_passadas`, como a hipótese da v2 sugere? Os pontos
-1/3 (ressalva da seção 1) se comportam como esperado de uma política
-quase não-treinada, ou surpreendem? Vale a pena rodar a versão completa
-nos 3 folds depois, com mais orçamento de tempo?)*
+- **Resultado central, e ele CONTRADIZ a hipótese da v2.** A v2 sugeriu
+  que menos passadas reduziria overfitting. O sweep mostra o oposto na
+  faixa testada: `passadas` baixo (1, 3, 5) não é "menos overfitting" —
+  é **subtreinamento severo**. A política nesses pontos executa menos
+  de 3 atualizações PPO completas (ver seção 1) e se comporta
+  essencialmente como uma rede aleatória, que aqui significa
+  negociar sem parar e perder pro custo de transação a cada operação.
+  Só a partir de `passadas=10` a política começa a aprender a parar de
+  operar tanto, e só em `passadas=20` (o maior valor testado) o
+  resultado fica perto-de-neutro/levemente positivo.
+- **Isso não invalida necessariamente o diagnóstico de overfitting da
+  v2 nos folds 2 e 3** -- mas mostra que o sweep, restrito ao fold 1 (1
+  chunk único em todos os pontos testados), não isola a causa real do
+  problema da v2. Fold 1 nunca precisou de resume/encadeamento de jobs
+  em nenhum ponto deste sweep; os folds 2 e 3 da v2 precisaram de 4 e 7
+  chunks encadeados MESMO em `passadas=20`. Ou seja, este sweep testou
+  "quantidade de treino" isoladamente dentro de um regime de 1 chunk só
+  -- não testou se o mecanismo de checkpoint+resume entre múltiplos
+  jobs, ou o tamanho do fold (8 vs. 32/56 dias de treino), contribui
+  pro prejuízo dos folds maiores da v2. Essas duas variáveis (nº de
+  chunks, tamanho do fold) ficaram confundidas com `passadas` na v2 e
+  não foram isoladas aqui.
+- **Implicação prática imediata**: não vale reduzir `target_n_passadas`
+  abaixo de 20 -- os dados mostram claramente o oposto do que a v2
+  sugeria. Dado que `passadas=20` foi o MELHOR ponto testado e a curva
+  de validação ainda estava subindo no final da rodada (ver
+  `sweep_p20.png`), o próximo passo natural é testar valores ACIMA de
+  20 (ex.: 30, 40) no fold 1, em vez de abaixo.
+- **Segundo próximo passo, pra isolar as variáveis confundidas**: rodar
+  o mesmo sweep de `passadas` no fold 2 ou 3 (que precisam de múltiplos
+  chunks mesmo em valores baixos de `passadas`, dado que têm mais dias
+  de treino) -- se o mesmo padrão de "quanto mais passadas, melhor"
+  aparecer lá também, o problema da v2 não era passadas em si, e sim
+  algo específico do encadeamento multi-chunk ou do tamanho do fold.

@@ -1,0 +1,96 @@
+RUN_TAG=p3  CHUNK_INDEX=1
+=== Folds walk-forward (TimeSeriesSplit, n_folds=3) ===
+Throughput assumido : 4,209 steps/s  (ajuste para a máquina onde for treinar)
+Passadas-alvo/dia   : 3.0 (igual para todos os folds)
+Chunk (job Slurm)   : 1140s de treino real por job encadeado
+Ticks médios/pregão : 27,662
+Pregões disponíveis : 80  |  pregões usados: 80
+  Fold 1: treino=[  1..  8] (  8 dias)  validação=[  9.. 20] ( 12 dias)  teste=[ 21.. 32] ( 12 dias)  total_timesteps=663,888 (~3.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+  Fold 2: treino=[  1.. 32] ( 32 dias)  validação=[ 33.. 44] ( 12 dias)  teste=[ 45.. 56] ( 12 dias)  total_timesteps=2,655,552 (~3.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+  Fold 3: treino=[  1.. 56] ( 56 dias)  validação=[ 57.. 68] ( 12 dias)  teste=[ 69.. 80] ( 12 dias)  total_timesteps=4,647,216 (~3.0 passadas/dia de treino, 1 chunk(s) de 1140s)
+
+########## FOLD 1/3 ##########
+Using cpu device
+Logging to logs/p3/fold1/chunk1
+Eval num_timesteps=36864, episode_reward=-69086.46 +/- 11541.47
+Episode length: 33332.67 +/- 5560.20
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.33e+04  |
+|    mean_reward     | -6.91e+04 |
+| time/              |           |
+|    total_timesteps | 36864     |
+----------------------------------
+New best mean reward!
+Eval num_timesteps=73728, episode_reward=-71990.62 +/- 12860.29
+Episode length: 34659.50 +/- 5949.64
+---------------------------------
+| eval/              |          |
+|    mean_ep_length  | 3.47e+04 |
+|    mean_reward     | -7.2e+04 |
+| time/              |          |
+|    total_timesteps | 73728    |
+---------------------------------
+Eval num_timesteps=110592, episode_reward=-64576.25 +/- 13483.08
+Episode length: 30805.42 +/- 6344.47
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.08e+04  |
+|    mean_reward     | -6.46e+04 |
+| time/              |           |
+|    total_timesteps | 110592    |
+----------------------------------
+New best mean reward!
+Eval num_timesteps=147456, episode_reward=-73516.46 +/- 8781.63
+Episode length: 35470.83 +/- 4080.77
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 3.55e+04  |
+|    mean_reward     | -7.35e+04 |
+| time/              |           |
+|    total_timesteps | 147456    |
+----------------------------------
+Eval num_timesteps=184320, episode_reward=-69003.33 +/- 10002.60
+Episode length: 32809.50 +/- 3897.94
+---------------------------------
+| eval/              |          |
+|    mean_ep_length  | 3.28e+04 |
+|    mean_reward     | -6.9e+04 |
+| time/              |          |
+|    total_timesteps | 184320   |
+---------------------------------
+[TimeLimitCallback] deadline atingido (141s além do limite) -- parando treino com margem de segurança.
+
+=== Fold 1 -- Avaliação em VALIDAÇÃO ===
+    order  lucro_total  negocios_fechados  negocios_vencedores
+0       9     -71895.0               9070                  914
+1      10     -48212.5               6233                  470
+2      11     -54112.5               6975                  620
+3      12     -76540.0               9728                  930
+4      13     -82287.5              10257                 1052
+5      14     -86215.0              10912                 1297
+6      15     -67672.5               8643                 1033
+7      16     -73837.5               9415                  856
+8      17     -65210.0               8370                  903
+9      18     -82430.0              10588                 1381
+10     19     -56935.0               7224                  698
+11     20     -38435.0               5008                  447
+
+Lucro total agregado: -803782.50 pontos (R$ -160756.50)
+Negócios fechados: 102423
+Taxa de acerto: 10.35%
+
+=== Distribuição de P&L por negócio (líquida de custos) ===
+Total de negócios: 102423  |  vencedores: 10601  |  perdedores: 91822
+Ganho médio       : 6.55   |  mediana: 2.50   |  máximo: 92.50
+Perda média       : -9.51   |  mediana: -7.50   |  mínimo: -202.50
+Perda média / Ganho médio: 1.45x
+  percentil  1: -27.50
+  percentil  5: -17.50
+  percentil 25: -12.50
+  percentil 50: -7.50
+  percentil 75: -2.50
+  percentil 95: 2.50
+  percentil 99: 12.50
+
+=== Fold 1 -- Avaliação em TESTE PULADA (121s restantes, menos que a reserva de 150s) -- o checkpoint já está salvo; rode evaluate_policy() depois carregando-o. ===
