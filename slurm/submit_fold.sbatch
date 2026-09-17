@@ -55,6 +55,10 @@ export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
 export RESUME_TRAINING="${RESUME_TRAINING:-0}"
 export FINAL_CHUNK="${FINAL_CHUNK:-1}"
+# RUN_TAG/CHUNK_INDEX: ver slurm/submit_all_folds.sh -- defaults preservam
+# o comportamento de sempre (v1/v2) quando este arquivo é chamado direto.
+export RUN_TAG="${RUN_TAG:-}"
+export CHUNK_INDEX="${CHUNK_INDEX:-1}"
 
 # Escolha de hoje (2026-09-16): usar bem menos que os 480 pregões
 # disponíveis (ver MAX_PREGOES em rl_trading_pipeline.py) -- mesmo default

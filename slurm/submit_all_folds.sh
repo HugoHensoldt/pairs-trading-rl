@@ -20,6 +20,20 @@ N_FOLDS=3  # mesmo N_FOLDS de src/rl_trading_pipeline.py -- ajuste junto se muda
 # sbatch, e usado tanto no cálculo do plano quanto no treino real.
 export MAX_PREGOES="${MAX_PREGOES:-80}"
 
+# RUN_TAG: identifica rodadas diferentes do MESMO fold sem colidir
+# artefatos (checkpoint/best_model/log CSV) -- usado pelo sweep de
+# TARGET_N_PASSADAS (ver slurm/submit_sweep.sh). Sem a env var, ""
+# reproduz o comportamento de sempre (v1/v2). Entra no --job-name abaixo,
+# e por consequência no nome do arquivo .out (%x-%j.out).
+export RUN_TAG="${RUN_TAG:-}"
+
+# FOLDS: quais folds treinar nesta chamada, em ordem (default: todos os
+# N_FOLDS). O sweep de TARGET_N_PASSADAS usa FOLDS="1" pra rodar só o
+# fold 1 (menor) em cada ponto do sweep, mantendo os MESMOS folds (mesma
+# função generate_walk_forward_folds, mesmo MAX_PREGOES) mas sem pagar o
+# custo de treinar os 3.
+FOLDS="${FOLDS:-$(seq 1 "$N_FOLDS")}"
+
 cd "$(dirname "$0")/.."
 
 # Quantos jobs de 20min encadear POR FOLD -- não é mais um número fixo
@@ -45,7 +59,7 @@ module load python/3.10.16_sequana
 source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
 export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 
-echo "=== Calculando plano de chunks por fold (TARGET_N_PASSADAS=${TARGET_N_PASSADAS:-20.0}) ==="
+echo "=== Calculando plano de chunks por fold (TARGET_N_PASSADAS=${TARGET_N_PASSADAS:-20.0}, RUN_TAG=${RUN_TAG:-<vazio>}, FOLDS=${FOLDS}) ==="
 declare -A CHUNKS_POR_FOLD
 while read -r fold_num n_chunks; do
     CHUNKS_POR_FOLD["$fold_num"]="$n_chunks"
@@ -64,7 +78,7 @@ wait_for_empty_queue() {
     done
 }
 
-for i in $(seq 1 "$N_FOLDS"); do
+for i in $FOLDS; do
     n_chunks="${CHUNKS_POR_FOLD[$i]:?fold $i não apareceu no plano do PRINT_FOLD_PLAN}"
     for chunk in $(seq 1 "$n_chunks"); do
         resume=1
@@ -73,13 +87,13 @@ for i in $(seq 1 "$N_FOLDS"); do
         if [ "$chunk" -eq "$n_chunks" ]; then final=1; fi
 
         wait_for_empty_queue
-        echo "=== Submetendo fold $i/$N_FOLDS, chunk $chunk/$n_chunks ($(date)) ==="
+        echo "=== Submetendo fold $i (RUN_TAG=${RUN_TAG:-<vazio>}), chunk $chunk/$n_chunks ($(date)) ==="
         sbatch --wait \
-            --job-name="pairs-rl-fold${i}" \
-            --export=ALL,SLURM_ARRAY_TASK_ID="$i",RESUME_TRAINING="$resume",FINAL_CHUNK="$final" \
+            --job-name="pairs-rl-fold${i}${RUN_TAG:+-$RUN_TAG}" \
+            --export=ALL,SLURM_ARRAY_TASK_ID="$i",RESUME_TRAINING="$resume",FINAL_CHUNK="$final",CHUNK_INDEX="$chunk" \
             slurm/submit_fold.sbatch
         echo "=== Fold $i, chunk $chunk concluído ($(date)) ==="
     done
 done
 
-echo "=== Todos os $N_FOLDS folds concluídos ==="
+echo "=== Folds concluídos: $FOLDS ==="

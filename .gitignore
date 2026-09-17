@@ -8,6 +8,12 @@
 *.keras
 *.zip
 best_model/
+best_model_fold*/
+
+# Logs CSV do SB3 por rodada de treino (ver train_ppo() log_dir em
+# rl_trading_pipeline.py) -- grandes e regeneráveis, não vão pro repo;
+# só os PNGs/CSVs resumidos gerados por src/analyze_sweep.py em docs/ vão.
+logs/
 
 # Python
 __pycache__/

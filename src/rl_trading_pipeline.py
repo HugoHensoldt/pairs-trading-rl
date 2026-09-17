@@ -71,6 +71,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
+from stable_baselines3.common.logger import configure as configure_logger
 
 from config import data_path, POINT_VALUE_BRL
 
@@ -682,7 +683,7 @@ def generate_walk_forward_folds(
 
 def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_000,
               model_path="ppo_arbitrage.zip", best_model_dir="./best_model",
-              max_seconds=None, resume_from=None):
+              max_seconds=None, resume_from=None, log_dir=None):
     # a normalização é ajustada SOMENTE com os dias de treino
     train_dfs_feats = []
     for order in train_orders:
@@ -774,6 +775,14 @@ def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_
         n_eval_episodes=len(val_orders),  # 1 episódio por dia de validação do fold atual
         deterministic=True,
     )
+
+    # log_dir: grava rollout/ep_rew_mean (treino) e eval/mean_reward
+    # (validação, do EvalCallback acima) em progress.csv, nas mesmas
+    # linhas/eixo de time/total_timesteps -- usado para o gráfico de
+    # overfitting do sweep de target_n_passadas (distância entre as duas
+    # curvas). Sem log_dir, comportamento igual a antes (só stdout).
+    if log_dir is not None:
+        model.set_logger(configure_logger(log_dir, ["stdout", "csv"]))
 
     callbacks = [eval_callback]
     if max_seconds is not None:
@@ -880,6 +889,18 @@ if __name__ == "__main__":
     target_n_passadas = float(os.environ.get("TARGET_N_PASSADAS", "20.0"))
     throughput_steps_per_sec = float(os.environ.get("THROUGHPUT_STEPS_PER_SEC", "4209.0"))
 
+    # RUN_TAG: sufixo pra não colidir artefatos (checkpoint, best_model,
+    # log CSV) entre rodadas diferentes com o MESMO fold (ex.: um sweep de
+    # TARGET_N_PASSADAS) -- sem a env var, "" reproduz os caminhos de
+    # sempre (compatível com v1/v2). CHUNK_INDEX só nomeia o subdiretório
+    # de log CSV por chunk, pra um chunk não sobrescrever o CSV do
+    # anterior na mesma cadeia de resume.
+    run_tag = os.environ.get("RUN_TAG", "")
+    tag_suffix = f"_{run_tag}" if run_tag else ""
+    chunk_index = os.environ.get("CHUNK_INDEX", "1")
+    if run_tag:
+        print(f"RUN_TAG={run_tag}  CHUNK_INDEX={chunk_index}")
+
     folds = generate_walk_forward_folds(
         all_orders, n_folds=N_FOLDS,
         target_n_passadas=target_n_passadas,
@@ -905,7 +926,7 @@ if __name__ == "__main__":
         f = next(ff for ff in folds if ff["fold"] == fold_num)
         train_feats = [build_feature_matrix(process_day(o)) for o in f["train_orders"]]
         mean, std = fit_feature_scaler(train_feats)
-        model_path = f"ppo_arbitrage_fold{fold_num}.zip"
+        model_path = f"ppo_arbitrage_fold{fold_num}{tag_suffix}.zip"
         print(f"\n########## FOLD {fold_num} -- AVALIAÇÃO ISOLADA (checkpoint: {model_path}) ##########")
         model = PPO.load(model_path)
         print(f"\n=== Fold {fold_num} -- Avaliação em VALIDAÇÃO ===")
@@ -963,14 +984,17 @@ if __name__ == "__main__":
 
     for f in folds_to_run:
         print(f"\n########## FOLD {f['fold']}/{len(folds)} ##########")
-        model_path = f"ppo_arbitrage_fold{f['fold']}.zip"
+        model_path = f"ppo_arbitrage_fold{f['fold']}{tag_suffix}.zip"
+        run_label = run_tag or "default"
+        log_dir = f"logs/{run_label}/fold{f['fold']}/chunk{chunk_index}"
         model, (mean, std) = train_ppo(
             f["train_orders"], f["val_orders"],
             total_timesteps=f["total_timesteps"],
             model_path=model_path,
-            best_model_dir=f"./best_model_fold{f['fold']}",
+            best_model_dir=f"./best_model_fold{f['fold']}{tag_suffix}",
             max_seconds=max_seconds,
             resume_from=(model_path if resume_training else None),
+            log_dir=log_dir,
         )
 
         if final_chunk:

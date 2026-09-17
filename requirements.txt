@@ -5,3 +5,4 @@ tensorflow
 gymnasium
 stable-baselines3
 jupyter
+matplotlib  # só usado localmente por src/analyze_sweep.py (plots), não no treino no cluster
