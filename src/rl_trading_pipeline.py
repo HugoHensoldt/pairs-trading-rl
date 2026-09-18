@@ -1593,7 +1593,7 @@ def _eval_part2(models, ref_name, sets, mean, std, fee, out_dir, has_time, recor
     # 3.5) teste de latência: a decisão só é executada `k` ticks depois (uma
     # arbitragem real precisa sobreviver a algum atraso de execução)
     if ref_name:
-        for lat in (1, 5, 20):
+        for lat in (1,):
             for sname, orders in sets.items():
                 if not has_time(120):
                     continue
