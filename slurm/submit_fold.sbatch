@@ -1,5 +1,5 @@
 #!/bin/bash
-# Treina 1 fold do walk-forward. A conta ppg-lncc/QOS normal tem
+# Treina 1 chunk (ou avalia) 1 fold da v4. A conta ppg-lncc/QOS normal tem
 # MaxSubmit=1 (só 1 job na fila por vez) -- por isso NÃO usamos
 # --array aqui (um array de N tasks conta como N jobs simultâneos pro
 # Slurm e é rejeitado com AssocMaxSubmitJobLimit). Os folds treinam
@@ -46,64 +46,36 @@ source "/scratch/ppg-lncc/$USER/envs/pairs-rl/bin/activate"
 # diretório de scratch do seu projeto com `ls /scratch/`
 export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 
-# --- qual fold treinar / treino em chunks (resume) ------------------------
-# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID (fold) e, quando o
-# fold precisa de mais de 1 chunk pra chegar em TARGET_N_PASSADAS (ver
-# generate_walk_forward_folds), também RESUME_TRAINING/FINAL_CHUNK.
-# Chamando este arquivo direto (sem exportar nada), os defaults preservam
-# o comportamento de sempre: fold 1, treina do zero, avalia ao final.
+# --- qual fold / qual modo ------------------------------------------------
+# slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID (fold),
+# RESUME_TRAINING/CHUNK_INDEX (treino em chunks) e RUN_EVAL (=1 para o job
+# de AVALIAÇÃO do fold, que não treina). Chamando este arquivo direto (sem
+# exportar nada): fold 1, chunk 1, treina do zero, RUN_TAG=v4.
 export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
 export RESUME_TRAINING="${RESUME_TRAINING:-0}"
-export FINAL_CHUNK="${FINAL_CHUNK:-1}"
-# RUN_TAG/CHUNK_INDEX: ver slurm/submit_all_folds.sh -- defaults preservam
-# o comportamento de sempre (v1/v2) quando este arquivo é chamado direto.
-export RUN_TAG="${RUN_TAG:-}"
 export CHUNK_INDEX="${CHUNK_INDEX:-1}"
+export RUN_EVAL="${RUN_EVAL:-0}"
+export RUN_TAG="${RUN_TAG:-v4}"
 
-# Escolha de hoje (2026-09-16): usar bem menos que os 480 pregões
-# disponíveis (ver MAX_PREGOES em rl_trading_pipeline.py) -- mesmo default
-# usado em slurm/submit_all_folds.sh, repetido aqui pra quem chamar este
-# arquivo direto (sem passar por submit_all_folds.sh) também ficar na
-# mesma escala reduzida em vez de cair nos 480 pregões completos.
-export MAX_PREGOES="${MAX_PREGOES:-80}"
+# Cache dos pregões já processados (.npz) em /scratch: o startup de cada
+# chunk carrega TODOS os dias de treino em ~48 processos, e sem cache isso
+# reprocessa os JSONs UTF-16 toda vez.
+export DAY_CACHE_DIR="/scratch/ppg-lncc/$USER/day_cache"
 
 # --- margem de segurança sob o MaxTime=00:20:00 (1200s) do job ------------
 # Contados a partir do início do processo Python (SCRIPT_START), não do
 # início do learn() -- ver TimeLimitCallback em rl_trading_pipeline.py.
 #
-# JOB_HARD_SECONDS=1170 (19min30, 30s de colchão antes do kill de
-# verdade): se não sobrar pelo menos EVAL_RESERVE_SECONDS (150s, ver
-# rl_trading_pipeline.py) até essa marca, a avaliação de
-# validação/teste é PULADA em vez de arriscar ser cortada no meio (o
-# checkpoint do modelo já está salvo nesse ponto, então nada se perde
-# de fato -- só o relatório impresso, recuperável depois).
-#
-# TRAIN_MAX_SECONDS varia conforme FINAL_CHUNK (ver slurm/submit_all_folds.sh
-# pra como isso é orquestrado num treino em vários chunks encadeados):
-# - chunk final (FINAL_CHUNK=1, ou não setado -- job único como antes):
-#   780s (13min), reservando tempo pro evaluate_policy() de validação+
-#   teste que roda depois do learn().
-# - chunk intermediário (FINAL_CHUNK=0): não faz avaliação, então pode
-#   treinar bem mais perto do limite de 20min -- 1140s (19min), só
-#   reservando tempo pro model.save() final e encerramento do job.
-#
-# IMPORTANTE: os 1140s do chunk intermediário são o mesmo valor do
-# default `chunk_seconds` em generate_walk_forward_folds()
-# (rl_trading_pipeline.py) -- é isso que converte total_timesteps em
-# n_chunks_needed por fold. Mudar um sem o outro faz o número de chunks
-# planejado (PRINT_FOLD_PLAN) não bater com o tempo real disponível por
-# job.
-#
-# Um smoke test real (fold 1, 7 dias de treino) mostrou ~180s de
-# overhead antes do learn() comecar e a avaliação sozinha não terminou
-# em ~90s -- estes valores dão bastante margem sobre isso. Folds com
-# mais dias de treino (ex.: fold 3, 45 dias) tendem a ter overhead de
-# carregamento de dados MAIOR, não menor -- se a folga ainda não for
-# suficiente, aumente esses números.
+# - Job de TREINO: TRAIN_MAX_SECONDS=1140 (19 min), só reservando tempo
+#   para o model.save() e o encerramento. Não há mais chunk "final" com
+#   reserva de avaliação: a avaliação roda num job próprio (RUN_EVAL=1).
+#   O ValidationCallback pula a validação periódica se restarem < 240s.
+# - Job de AVALIAÇÃO: JOB_HARD_SECONDS=1170; cada etapa da avaliação só
+#   começa se sobrar tempo (ver run_eval_job), na ordem de importância:
+#   modelos principais -> baselines -> sensibilidade a custo -> curva de
+#   checkpoints.
 export JOB_HARD_SECONDS=1170
-if [ "$FINAL_CHUNK" = "1" ]; then
-    export TRAIN_MAX_SECONDS=780
-else
+if [ "$RUN_EVAL" != "1" ]; then
     export TRAIN_MAX_SECONDS=1140
 fi
 

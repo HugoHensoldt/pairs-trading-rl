@@ -1,34 +1,40 @@
 """
-Reinforcement Learning para negociação intradiária BOVA11 x WINM21 --
-5 features: spread de mispricing, spread bid-ask, atribuição de
-movimento (BOVA vs WIN) e momentum (curto e longo).
+Reinforcement Learning para negociação intradiária BOVA11 x WINM21 -- v4.
+
+Estado SIMPLIFICADO (4 dimensões, só o tick atual, sem janela):
+    [spread_compra, spread_venda, posição (-1/0/+1), P/L não realizado]
+  spread_compra = ask_WIN - Wbjusto   (comprar WIN / vender BOVA no bid)
+  spread_venda  = bid_WIN - Wajusto   (vender WIN / comprar BOVA no ask)
+(ver build_state_features; as versões v1-v3 usavam uma janela de 120 ticks
+x 5 features + posição one-hot + P/L = 604 dimensões).
 
 Diferente da abordagem supervisionada (LSTM prevendo Lucro/Prejuízo por
 negociação com stops fixos Re/Ri), aqui o agente controla a posição TICK A
 TICK: decide entrar, segurar ou sair a cada instante, aprendendo sua
 própria política de entrada/saída.
 
-O estado do agente é composto por uma JANELA de N_TICKS valores de cada
-uma das 5 features (ver build_feature_matrix para detalhes de cada uma)
--- sem bandas de Bollinger, sem volume, sem retornos separados.
-
 Requer:
     pip install gymnasium stable-baselines3
 
 Estrutura:
-  1) process_day()          -> gera o preço-justo (Wajusto/Wbjusto) de um
-                                pregão, sem bandas de Bollinger
-  2) build_feature_matrix() -> calcula as 5 features (RL_FEATURE_NAMES)
-                                por tick
+  1) process_day()/process_day_cached() -> preço-justo (Wajusto/Wbjusto) de
+                                um pregão (o cached grava .npz em disco)
+  2) build_state_features() -> os 2 spreads do estado v4 por tick
+     (build_feature_matrix() e RL_FEATURE_NAMES são da v1-v3 e continuam
+     aqui porque rl_exit_only.py importa deles)
   3) fit_feature_scaler()   -> normaliza usando estatística SOMENTE do
-                                treino
+                                treino (salvo em runs/<tag>/fold<N>/scaler.npz)
   4) ArbitrageTradingEnv    -> ambiente Gymnasium: 1 episódio = 1 pregão
   5) MultiDayEnv            -> alterna entre vários pregões pré-carregados
-                                a cada reset, para treinar em múltiplos dias
-  6) train_ppo()            -> treina um agente PPO (stable-baselines3)
-  7) evaluate_policy()      -> roda a política treinada nos dias de
-                                teste/validação e reporta lucro total,
-                                número de negociações e taxa de acerto
+  6) generate_fixed_window_folds() -> folds de janela expansiva com
+                                tamanhos de treino fixos (100/150/200)
+  7) train_chunk()          -> treina PPO até TOTAL_TIMESTEPS ou até o
+                                deadline do job; checkpoint/resume entre
+                                jobs Slurm; state.json marca `done`
+  8) run_eval_job()         -> avaliação de val/teste (melhor-de-validação
+                                e último), baselines, sensibilidade a custo
+                                e curva de checkpoints, tudo em CSV
+Saídas em runs/<RUN_TAG>/fold<N>/ (ver slurm/submit_all_folds.sh).
 """
 
 import math
@@ -79,7 +85,7 @@ from config import data_path, POINT_VALUE_BRL
 # (que roda o forward/backward da rede via torch, concorrendo por CPU com
 # os processos do SubprocVecEnv) -- por padrão o torch abre 1 thread por
 # núcleo físico, o que sozinho já tomaria o nó inteiro.
-torch.set_num_threads(1)
+torch.set_num_threads(int(os.environ.get("TORCH_THREADS", "1")))
 
 
 def _detect_n_train_envs():
@@ -168,6 +174,52 @@ def process_day(order, Periodo=3000):
     return df
 
 
+def _day_cache_dir():
+    d = os.environ.get("DAY_CACHE_DIR") or os.path.join(os.environ.get("RUNS_DIR", "runs"), "_day_cache")
+    return d
+
+
+_DAY_MEMO = {}
+
+
+def process_day_cached(order, Periodo=3000):
+    """process_day() com cache em .npz das colunas usadas na v4 (bid, ask,
+    Wbjusto, Wajusto, datahora). Ler/parsear os JSONs UTF-16 e calcular as
+    médias móveis é o que dominava o startup de cada chunk (cada um dos ~48
+    processos do SubprocVecEnv carrega TODOS os dias de treino); com o
+    cache o startup vira leitura de arrays. O arquivo é gravado de forma
+    atômica (tmp + replace) porque vários processos podem preencher o mesmo
+    dia ao mesmo tempo."""
+    cols = ('bid', 'ask', 'Wbjusto', 'Wajusto')
+    # memo em memória: com DummyVecEnv, dezenas de envs no MESMO processo
+    # pedem os mesmos dias -- carrega cada um uma vez só (o df não é
+    # modificado por ninguém, só lido)
+    if (order, Periodo) in _DAY_MEMO:
+        return _DAY_MEMO[(order, Periodo)]
+    path = os.path.join(_day_cache_dir(), f"day{order}_p{Periodo}.npz")
+    if os.path.exists(path):
+        try:
+            z = np.load(path)
+            out = {c: z[c] for c in cols}
+            out['datahora'] = z['datahora']
+            _DAY_MEMO[(order, Periodo)] = pd.DataFrame(out)
+            return _DAY_MEMO[(order, Periodo)]
+        except Exception:
+            pass  # cache corrompido/parcial: reprocessa abaixo
+    df = process_day(order, Periodo)
+    slim = pd.DataFrame({c: df[c].to_numpy(dtype=float) for c in cols})
+    slim['datahora'] = pd.to_datetime(df['datahora']).to_numpy()
+    try:
+        os.makedirs(_day_cache_dir(), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp.npz"
+        np.savez(tmp, **{c: slim[c].to_numpy() for c in slim.columns})
+        os.replace(tmp, path)
+    except OSError:
+        pass  # cache é só otimização
+    _DAY_MEMO[(order, Periodo)] = slim
+    return slim
+
+
 # --------------------------------------------------------------------------
 # 2) FEATURES: MISPRICING + SPREAD BID-ASK + QUEM MOVEU + MOMENTUM
 # --------------------------------------------------------------------------
@@ -244,6 +296,31 @@ def build_feature_matrix(df):
     ], axis=1)
 
 
+STATE_FEATURE_NAMES = ['spread_compra', 'spread_venda']
+
+
+def build_state_features(df):
+    """Features de mercado do estado v4 (n, 2) -- só o tick atual, sem janela.
+
+    Colunas (ver STATE_FEATURE_NAMES):
+      spread_compra = ask_WIN - Wbjusto
+          quanto se PAGA a mais para comprar o WIN em relação ao que se
+          recebe vendendo o BOVA11 (comprar WIN no ask / vender BOVA no bid).
+      spread_venda  = bid_WIN - Wajusto
+          quanto se RECEBE a mais vendendo o WIN em relação ao que se paga
+          comprando o BOVA11 (vender WIN no bid / comprar BOVA no ask).
+
+    Diferente do mispricing de mid (build_feature_matrix), cada spread já
+    embute o custo de cruzar o book do WIN e do preço justo -- o agente
+    enxerga o desalinhamento LÍQUIDO de cada lado. Posição atual e P/L não
+    realizado são anexados por ArbitrageTradingEnv._get_obs (não passam
+    pelo scaler).
+    """
+    spread_compra = (df['ask'] - df['Wbjusto']).to_numpy(dtype=float)
+    spread_venda = (df['bid'] - df['Wajusto']).to_numpy(dtype=float)
+    return np.stack([spread_compra, spread_venda], axis=1)
+
+
 def fit_feature_scaler(feature_matrices):
     """Ajusta média/desvio-padrão usando SOMENTE as matrizes de treino
     (lista de arrays, uma por dia). Retorna (mean, std) para normalizar
@@ -272,9 +349,10 @@ class ArbitrageTradingEnv(gym.Env):
         1 = comprado
         2 = vendido  (internamente convertido para -1)
 
-    Observação (Box): janela de N_TICKS ticks de features relativas,
-    achatada em um vetor, concatenada com [posição atual (one-hot, 3),
-    PnL não-realizado normalizado (1)].
+    Observação (Box, 4 dimensões, só o tick atual -- sem janela):
+    [spread_compra, spread_venda (normalizados, ver build_state_features),
+    posição atual (-1/0/+1), PnL não-realizado normalizado pelo spread
+    bid-ask do tick].
 
     Recompensa: variação de marcação a mercado (mid-price) da posição já
     aberta desde o tick anterior, MENOS custo de execução (metade do
@@ -293,18 +371,23 @@ class ArbitrageTradingEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, df, feature_matrix, n_ticks=120, transaction_fee=2.5,
-                 reward_scale=1.0, max_loss_per_position=None):
+    def __init__(self, df, feature_matrix, transaction_fee=2.5,
+                 reward_scale=1.0, max_loss_per_position=None,
+                 record_equity=False):
         super().__init__()
         assert len(df) == len(feature_matrix)
-        self.df = df
+        # só o tamanho do pregão é guardado (não o DataFrame): cada um dos
+        # ~48 processos do SubprocVecEnv carrega TODOS os dias de treino, e
+        # com 100-200 dias o df completo (~20 colunas) custaria GBs por
+        # processo sem ser usado depois de extraídos bid/ask.
+        self.n_day_ticks = len(df)
+        self.record_equity = record_equity
         # bid/ask pré-extraídos como arrays numpy: evita .iloc (indexação
         # pandas) tick a tick dentro de step()/_get_obs(), que é bem mais
         # lento que indexação numpy direta.
         self.bid = df['bid'].to_numpy(dtype=float)
         self.ask = df['ask'].to_numpy(dtype=float)
-        self.feature_matrix = feature_matrix
-        self.n_ticks = n_ticks
+        self.feature_matrix = feature_matrix.astype(np.float32)
         self.transaction_fee = transaction_fee
         self.reward_scale = reward_scale
         # stop-loss por posição: regra FIXA (não aprendida), desligada por
@@ -315,7 +398,7 @@ class ArbitrageTradingEnv(gym.Env):
         self.max_loss_per_position = max_loss_per_position
         self.n_features = feature_matrix.shape[1]
 
-        obs_dim = self.n_ticks * self.n_features + 3 + 1
+        obs_dim = self.n_features + 1 + 1      # features + posição + P/L
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
                                              shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(3)
@@ -323,21 +406,24 @@ class ArbitrageTradingEnv(gym.Env):
         self._reset_state()
 
     def _reset_state(self):
-        self.t = self.n_ticks - 1          # primeiro tick com histórico completo
+        self.t = 0                         # sem janela: todo tick já tem estado completo
         self.position = 0                  # -1, 0, 1
         self.entry_price = 0.0             # preço de execução da posição aberta
         self.n_trades_closed = 0
         self.n_trades_won = 0
         self.trade_pnls = []               # P&L realizado de CADA negócio fechado
         self.n_stop_loss_triggers = 0      # quantas vezes o stop-loss forçou fechamento
+        # --- contadores para o relatório (avaliação/diagnóstico) ---------
+        self.ticks_long = 0
+        self.ticks_short = 0
+        self.gross_mtm = 0.0               # P/L de marcação a mercado, antes de custos
+        self.total_reward = 0.0            # reward acumulado (líquido de custos)
+        self.trade_durations = []          # ticks entre abrir e fechar cada negócio
+        self.trade_close_ticks = []        # índice do tick de fechamento de cada negócio
+        self._open_tick = 0
+        self.equity = [] if self.record_equity else None
 
     def _get_obs(self):
-        window = self.feature_matrix[self.t - self.n_ticks + 1: self.t + 1]
-        window_flat = window.flatten()
-
-        pos_onehot = np.zeros(3, dtype=np.float32)
-        pos_onehot[self.position + 1] = 1.0  # posição -1,0,1 -> índice 0,1,2
-
         bid_t = self.bid[self.t]
         ask_t = self.ask[self.t]
         if self.position == 1:
@@ -346,11 +432,15 @@ class ArbitrageTradingEnv(gym.Env):
             unrealized = self.entry_price - ask_t
         else:
             unrealized = 0.0
-        # normalização grosseira pelo spread médio para manter escala razoável
-        unrealized_norm = np.array([unrealized / max(ask_t - bid_t, 1e-6)],
-                                    dtype=np.float32)
+        # normalização pelo spread bid-ask do tick atual (não é média)
+        # para manter escala razoável
+        unrealized_norm = unrealized / max(ask_t - bid_t, 1e-6)
 
-        return np.concatenate([window_flat, pos_onehot, unrealized_norm]).astype(np.float32)
+        obs = np.empty(self.n_features + 2, dtype=np.float32)
+        obs[:self.n_features] = self.feature_matrix[self.t]
+        obs[self.n_features] = self.position
+        obs[self.n_features + 1] = unrealized_norm
+        return obs
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -389,6 +479,8 @@ class ArbitrageTradingEnv(gym.Env):
         net_realized = realized - self.transaction_fee
         self.n_trades_closed += 1
         self.trade_pnls.append(net_realized)
+        self.trade_durations.append(self.t - self._open_tick)
+        self.trade_close_ticks.append(self.t)
         if net_realized > 0:
             self.n_trades_won += 1
         return reward, realized
@@ -408,6 +500,7 @@ class ArbitrageTradingEnv(gym.Env):
             self.position = target_position
             return 0.0  # ir para flat não é abrir negócio: sem custo
         self.position = target_position
+        self._open_tick = self.t
         return -spread_cost - self.transaction_fee
 
     def step(self, action):
@@ -421,11 +514,13 @@ class ArbitrageTradingEnv(gym.Env):
 
         # 1) marcação a mercado da posição já aberta ANTES desta ação,
         #    desde o mid-price do tick anterior até agora
-        if self.t > self.n_ticks - 1:
+        if self.t > 0:
             bid_prev = self.bid[self.t - 1]
             ask_prev = self.ask[self.t - 1]
             mid_prev = (bid_prev + ask_prev) / 2
-            reward += self.position * (mid_t - mid_prev)
+            mtm = self.position * (mid_t - mid_prev)
+            reward += mtm
+            self.gross_mtm += mtm
 
         # 1.5) stop-loss por posição (regra FIXA, não aprendida -- ver
         #    __init__): se configurado e a perda não-realizada da posição
@@ -447,8 +542,13 @@ class ArbitrageTradingEnv(gym.Env):
             reward += close_reward
             reward += self._open_leg(target_position, bid_t, ask_t)
 
+        if self.position == 1:
+            self.ticks_long += 1
+        elif self.position == -1:
+            self.ticks_short += 1
+
         self.t += 1
-        terminated = self.t >= len(self.df) - 1
+        terminated = self.t >= self.n_day_ticks - 1
         truncated = False
 
         # 3) fim do pregão: força o fechamento de qualquer posição aberta
@@ -458,6 +558,10 @@ class ArbitrageTradingEnv(gym.Env):
             close_reward, _ = self._close_leg(bid_last, ask_last)
             reward += close_reward
             self.position = 0
+
+        self.total_reward += reward
+        if self.equity is not None:
+            self.equity.append(self.total_reward)
 
         obs = self._get_obs() if not terminated else np.zeros(
             self.observation_space.shape, dtype=np.float32)
@@ -501,7 +605,7 @@ class MultiDayEnv(gym.Env):
         return self.current_env.step(action)
 
 
-def build_day_envs(orders, mean, std, n_ticks=120, transaction_fee=2.5,
+def build_day_envs(orders, mean, std, transaction_fee=2.5,
                     max_loss_per_position=None):
     """Carrega e processa cada pregão em `orders` UMA VEZ, retornando uma
     lista de ArbitrageTradingEnv prontos para uso -- evita reler os JSONs
@@ -512,17 +616,17 @@ def build_day_envs(orders, mean, std, n_ticks=120, transaction_fee=2.5,
     """
     envs = []
     for order in orders:
-        df = process_day(order)
-        feat = build_feature_matrix(df)
+        df = process_day_cached(order)
+        feat = build_state_features(df)
         feat = apply_scaler(feat, mean, std)
-        envs.append(ArbitrageTradingEnv(df, feat, n_ticks=n_ticks,
+        envs.append(ArbitrageTradingEnv(df, feat,
                                          transaction_fee=transaction_fee,
                                          max_loss_per_position=max_loss_per_position))
     return envs
 
 
-def _make_multiday_env(orders, mean, std, n_ticks=120, transaction_fee=2.5,
-                        max_loss_per_position=None):
+def _make_multiday_env(orders, mean, std, transaction_fee=2.5,
+                        max_loss_per_position=None, seed=None):
     """Função construtora usada como env_fn do SubprocVecEnv.
 
     Recebe só identificadores leves (lista de números de pregão + mean/std
@@ -532,10 +636,10 @@ def _make_multiday_env(orders, mean, std, n_ticks=120, transaction_fee=2.5,
     processo pai para cada processo-filho -- só os `orders` (ints) e
     mean/std (arrays pequenos) atravessam o pickle.
     """
-    day_envs = build_day_envs(orders, mean, std, n_ticks=n_ticks,
+    day_envs = build_day_envs(orders, mean, std,
                                transaction_fee=transaction_fee,
                                max_loss_per_position=max_loss_per_position)
-    return Monitor(MultiDayEnv(day_envs))
+    return Monitor(MultiDayEnv(day_envs, seed=seed))
 
 
 # --------------------------------------------------------------------------
@@ -677,191 +781,671 @@ def generate_walk_forward_folds(
     return folds
 
 
-# --------------------------------------------------------------------------
-# 5) TREINO (PPO)
-# --------------------------------------------------------------------------
-
-def train_ppo(train_orders, val_orders, n_ticks=120, total_timesteps=5000, #300_000,
-              model_path="ppo_arbitrage.zip", best_model_dir="./best_model",
-              max_seconds=None, resume_from=None, log_dir=None):
-    # a normalização é ajustada SOMENTE com os dias de treino
-    train_dfs_feats = []
-    for order in train_orders:
-        df = process_day(order)
-        train_dfs_feats.append(build_feature_matrix(df))
-    mean, std = fit_feature_scaler(train_dfs_feats)
-
-    # treino: um processo por núcleo lógico, cada um reprocessando os dias
-    # de treino a partir dos identificadores (orders) -- só orders/mean/std
-    # (leves) atravessam o pickle para os processos-filho, não os
-    # DataFrames/arrays já montados.
-    n_train_envs = _detect_n_train_envs()
-    train_env_fns = [
-        partial(_make_multiday_env, train_orders, mean, std, n_ticks)
-        for _ in range(n_train_envs)
-    ]
-    vec_train_env = SubprocVecEnv(train_env_fns)
-
-    # validação: continua single-processo (EvalCallback roda com pouca
-    # frequência e precisa de n_eval_episodes == len(val_orders))
-    val_envs = build_day_envs(val_orders, mean, std, n_ticks=n_ticks)
-
-    def make_val_env():
-        return Monitor(MultiDayEnv(val_envs))
-
-    vec_val_env = DummyVecEnv([make_val_env])
-
-    # n_steps: cada episódio é 1 pregão inteiro (~27.700 ticks medidos nos
-    # pregões de amostra da tarefa 4, na mesma ordem de grandeza dos
-    # ~35.000 ticks/pregão típicos). Com n_steps=2048 (valor anterior), a
-    # cada atualização o agente via só 2048/27700 ≈ 7% de um pregão por
-    # env -- fatia pequena demais para o rollout capturar trechos
-    # representativos de um pregão inteiro (ex.: dinâmica de fechamento
-    # forçado no fim do dia). Subindo para n_steps=8192, cada rollout
-    # cobre 8192/27700 ≈ 30% de um pregão por env -- trecho bem mais
-    # representativo, sem ir até o episódio inteiro (o que multiplicaria
-    # por ~13x o tamanho do buffer e o tempo por atualização).
-    #
-    # batch_size: precisa dividir (n_steps × n_train_envs) -- mas
-    # n_train_envs = os.cpu_count() varia por máquina (tarefa 3), então
-    # escolhemos batch_size como divisor do PRÓPRIO n_steps (8192 = 2^13):
-    # qualquer divisor de n_steps também divide n_steps × n_train_envs
-    # para QUALQUER número de processos, sem depender da máquina.
-    # batch_size=1024 (8192/1024=8) dá um número de minibatches por época
-    # razoável (ex.: 8 processos -> buffer=65536 -> 64 minibatches/época).
-    n_steps = 8192
-    batch_size = 1024
-    assert n_steps % batch_size == 0, "batch_size deve dividir n_steps (e portanto n_steps × n_train_envs)"
-
-    # resume_from: continua o treino de um checkpoint já salvo (de um job
-    # anterior, ver TREINO EM CHUNKS abaixo) em vez de começar do zero --
-    # os hiperparâmetros (learning_rate, n_steps, etc.) já vêm salvos no
-    # checkpoint, não são reaplicados aqui.
-    if resume_from is not None and os.path.exists(resume_from):
-        print(f"Retomando treino a partir de '{resume_from}'.")
-        model = PPO.load(resume_from, env=vec_train_env)
-    else:
-        model = PPO(
-            "MlpPolicy",
-            vec_train_env,
-            learning_rate=3e-4,
-            n_steps=n_steps,
-            batch_size=batch_size,
-            gamma=0.999,        # horizonte longo: episódio = um pregão inteiro
-            verbose=1,
-        )
-
-    # eval_freq: no EvalCallback do SB3, `eval_freq` é contado em chamadas
-    # de callback (uma por env.step() do VecEnv), NÃO em timesteps totais
-    # -- cada chamada avança n_train_envs timesteps de uma vez (todos os
-    # processos em paralelo dão 1 passo por chamada). Ou seja, o número
-    # real de timesteps entre avaliações é eval_freq × n_train_envs.
-    # Queremos ~15-20 avaliações ao longo do treino inteiro (nem mais,
-    # que gasta tempo repetindo avaliação sem ganho, nem menos, que
-    # deixa a escolha de "melhor modelo" grosseira). Isolando eval_freq:
-    #   total_timesteps ≈ eval_freq × n_train_envs × n_avaliações
-    #   eval_freq ≈ total_timesteps / (n_avaliações × n_train_envs)
-    n_avaliacoes_alvo = 18  # meio do intervalo 15-20 pedido
-    eval_freq = max(1, int(total_timesteps / (n_avaliacoes_alvo * n_train_envs)))
-
-    # Nota (treino em chunks/resume): best_mean_reward começa em -inf a
-    # cada chamada desta função, então best_model_dir pode ser
-    # sobrescrito por um modelo deste chunk pior que o melhor de um
-    # chunk anterior. Por isso o resume_from acima sempre usa model_path
-    # (checkpoint "cru" salvo ao fim de cada chunk), nunca best_model_dir.
-    eval_callback = EvalCallback(
-        vec_val_env, best_model_save_path=best_model_dir,
-        eval_freq=eval_freq,
-        n_eval_episodes=len(val_orders),  # 1 episódio por dia de validação do fold atual
-        deterministic=True,
-    )
-
-    # log_dir: grava rollout/ep_rew_mean (treino) e eval/mean_reward
-    # (validação, do EvalCallback acima) em progress.csv, nas mesmas
-    # linhas/eixo de time/total_timesteps -- usado para o gráfico de
-    # overfitting do sweep de target_n_passadas (distância entre as duas
-    # curvas). Sem log_dir, comportamento igual a antes (só stdout).
-    if log_dir is not None:
-        model.set_logger(configure_logger(log_dir, ["stdout", "csv"]))
-
-    callbacks = [eval_callback]
-    if max_seconds is not None:
-        # max_seconds é contado a partir de SCRIPT_START (início do
-        # processo Python), não do início deste learn() -- ver docstring
-        # de TimeLimitCallback.
-        callbacks.append(TimeLimitCallback(SCRIPT_START + max_seconds, verbose=1))
-
-    # reset_num_timesteps=False ao retomar: NÃO zera o contador interno de
-    # timesteps do SB3, então total_timesteps aqui passa a significar
-    # "treinar total_timesteps A MAIS a partir de onde parou" (semântica
-    # do próprio SB3 quando reset_num_timesteps=False). Cada chunk só
-    # consegue treinar uma fração pequena disso no tempo real disponível
-    # (ver TimeLimitCallback) -- não precisa descontar steps já feitos
-    # manualmente, o corte real é por tempo de parede, não por contagem.
-    model.learn(total_timesteps=total_timesteps, callback=CallbackList(callbacks),
-                reset_num_timesteps=(resume_from is None))
-    model.save(model_path)
-
-    return model, (mean, std)
-
 
 # --------------------------------------------------------------------------
-# 6) AVALIAÇÃO -- roda a política determinística nos dias de teste
+# 4.6) FOLDS DE JANELA EXPANSIVA COM TAMANHOS FIXOS DE TREINO (v4)
 # --------------------------------------------------------------------------
 
-def evaluate_policy(model, orders, mean, std, n_ticks=120):
-    results = []
-    all_trade_pnls = []  # P&L de TODOS os negócios, de todos os dias, para o diagnóstico
+def generate_fixed_window_folds(
+    all_orders,
+    train_sizes=(100, 150, 200),
+    n_val=15,
+    n_test=15,
+    total_timesteps=30_000_000,
+    throughput_steps_per_sec=5500.0,
+    chunk_seconds=1050.0,
+    avg_ticks_per_day=None,
+    verbose=True,
+):
+    """Folds walk-forward de janela expansiva com tamanhos de treino FIXOS.
 
-    for order in orders:
-        df = process_day(order)
-        feat = apply_scaler(build_feature_matrix(df), mean, std)
-        env = ArbitrageTradingEnv(df, feat, n_ticks=n_ticks)
+    Fold i treina nos primeiros `train_sizes[i]` pregões e valida/testa nos
+    `n_val` + `n_test` pregões seguintes (cronológicos, no futuro do
+    treino daquele fold). Diferente de generate_walk_forward_folds (que usa
+    TimeSeriesSplit e não permite escolher os tamanhos), aqui o usuário
+    escolhe, ex.: 100/150/200 dias de treino.
 
-        obs, _ = env.reset()
-        done = False
-        total_reward = 0.0
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            done = terminated or truncated
+    O orçamento é em TIMESTEPS TOTAIS por fold (`total_timesteps`), não em
+    "passadas por dia": o que importa pro PPO é o número de atualizações
+    (o sweep mostrou política degenerada abaixo de ~10 atualizações),
+    independente de quantos dias há no treino. `n_passadas_medias` é só
+    informativo (total / (dias_treino × ticks_por_dia)).
 
-        results.append({
-            "order": order,
-            "lucro_total": total_reward,
-            "negocios_fechados": info["n_trades_closed"],
-            "negocios_vencedores": info["n_trades_won"],
+    `n_chunks_needed` é uma ESTIMATIVA (throughput × chunk_seconds); o
+    controle real é o `state.json` de cada fold, que marca `done` quando
+    `total_timesteps` é atingido -- ver slurm/submit_all_folds.sh.
+    """
+    needed = max(train_sizes) + n_val + n_test
+    assert len(all_orders) >= needed, (
+        f"são necessários {needed} pregões (maior treino {max(train_sizes)} + "
+        f"{n_val} val + {n_test} teste), só há {len(all_orders)}")
+
+    if avg_ticks_per_day is None:
+        env_avg = os.environ.get("AVG_TICKS_PER_DAY")
+        if env_avg:
+            avg_ticks_per_day = float(env_avg)
+        else:
+            avg_ticks_per_day = float(np.mean([len(process_day_cached(o)) for o in all_orders[:2]]))
+
+    timesteps_per_chunk = throughput_steps_per_sec * chunk_seconds
+    n_chunks_needed = max(1, math.ceil(total_timesteps / timesteps_per_chunk))
+
+    folds = []
+    for i, size in enumerate(train_sizes, start=1):
+        train_orders = list(all_orders[:size])
+        val_orders = list(all_orders[size:size + n_val])
+        test_orders = list(all_orders[size + n_val:size + n_val + n_test])
+        assert train_orders[-1] < val_orders[0] <= val_orders[-1] < test_orders[0], \
+            "ordem cronológica violada entre treino/validação/teste"
+        folds.append({
+            "fold": i,
+            "train_orders": train_orders,
+            "val_orders": val_orders,
+            "test_orders": test_orders,
+            "total_timesteps": int(total_timesteps),
+            "n_passadas_medias": total_timesteps / (size * avg_ticks_per_day),
+            "n_chunks_needed": n_chunks_needed,
         })
-        all_trade_pnls.extend(env.trade_pnls)
 
-    results_df = pd.DataFrame(results)
-    print(results_df)
-    lucro_total_pontos = results_df['lucro_total'].sum()
-    print(f"\nLucro total agregado: {lucro_total_pontos:.2f} pontos "
-          f"(R$ {lucro_total_pontos * POINT_VALUE_BRL:.2f})")
-    print(f"Negócios fechados: {results_df['negocios_fechados'].sum()}")
-    print(f"Taxa de acerto: "
-          f"{results_df['negocios_vencedores'].sum() / max(results_df['negocios_fechados'].sum(), 1):.2%}")
+    if verbose:
+        print(f"=== Folds de janela fixa (v4, {len(folds)} folds) ===")
+        print(f"Throughput assumido : {throughput_steps_per_sec:,.0f} steps/s")
+        print(f"Chunk (job Slurm)   : {chunk_seconds:.0f}s de treino efetivo por job")
+        print(f"Ticks médios/pregão : {avg_ticks_per_day:,.0f}")
+        print(f"Timesteps por fold  : {total_timesteps:,}")
+        for f in folds:
+            tr, va, te = f["train_orders"], f["val_orders"], f["test_orders"]
+            print(f"  Fold {f['fold']}: treino=[{tr[0]:>3}..{tr[-1]:>3}] ({len(tr):>3} dias)  "
+                  f"validação=[{va[0]:>3}..{va[-1]:>3}] ({len(va):>3} dias)  "
+                  f"teste=[{te[0]:>3}..{te[-1]:>3}] ({len(te):>3} dias)  "
+                  f"~{f['n_passadas_medias']:.1f} passadas/dia, "
+                  f"~{f['n_chunks_needed']} chunk(s)")
+    return folds
 
-    # --- Diagnóstico de distribuição de P&L por negócio (já líquido de custos) ---
-    pnls = np.array(all_trade_pnls)
-    wins = pnls[pnls > 0]
-    losses = pnls[pnls <= 0]
-    print("\n=== Distribuição de P&L por negócio (líquida de custos) ===")
-    print(f"Total de negócios: {len(pnls)}  |  vencedores: {len(wins)}  |  perdedores: {len(losses)}")
-    if len(wins) > 0:
-        print(f"Ganho médio       : {wins.mean():.2f}   |  mediana: {np.median(wins):.2f}   |  máximo: {wins.max():.2f}")
-    if len(losses) > 0:
-        print(f"Perda média       : {losses.mean():.2f}   |  mediana: {np.median(losses):.2f}   |  mínimo: {losses.min():.2f}")
-    if len(wins) > 0 and len(losses) > 0:
-        razao = abs(losses.mean()) / wins.mean()
-        print(f"Perda média / Ganho médio: {razao:.2f}x")
-    # percentis extremos ajudam a enxergar a "cauda" de perdas grandes
-    for p in [1, 5, 25, 50, 75, 95, 99]:
-        print(f"  percentil {p:>2}: {np.percentile(pnls, p):.2f}")
 
-    return results_df, pnls
+# --------------------------------------------------------------------------
+# 5) AVALIAÇÃO PARALELA POR DIA + REGISTRO DETALHADO
+# --------------------------------------------------------------------------
+# Cada pregão é um episódio independente, então a avaliação é paralelizada
+# por dia (um processo por dia). Sequencial, val+teste de 30 dias levaria
+# ~10 min por modelo (27k ticks × predict por dia) -- inviável no job de
+# 20 min do Santos Dumont quando se quer avaliar vários modelos/baselines.
+
+def _n_pool_workers():
+    """Processos para avaliação/pré-processamento paralelos por dia
+    (EVAL_WORKERS; default = CPUs alocadas). Cada worker importa torch, então
+    em máquinas com pouca RAM convém limitar."""
+    return int(os.environ.get("EVAL_WORKERS") or _detect_n_train_envs())
+
+
+def _mp_context():
+    import multiprocessing as mp
+    return mp.get_context("spawn" if os.name == "nt" else "fork")
+
+
+_EVAL = {}
+
+
+def _eval_init(spec, mean, std, fee):
+    torch.set_num_threads(1)
+    _EVAL["spec"] = spec
+    _EVAL["mean"] = mean
+    _EVAL["std"] = std
+    _EVAL["fee"] = fee
+    _EVAL["model"] = PPO.load(spec[1], device="cpu") if spec[0] == "model" else None
+
+
+def _make_policy(spec, model, order):
+    kind = spec[0]
+    if kind == "model":
+        return lambda obs: int(model.predict(obs, deterministic=True)[0])
+    if kind == "flat":
+        return lambda obs: 0
+    if kind == "random":
+        rng = np.random.default_rng(int(spec[1]) * 100003 + int(order))
+        return lambda obs: int(rng.integers(3))
+    if kind == "threshold":
+        # regra de reversão simples nos spreads JÁ normalizados (z-score):
+        # compra se WIN está "barato" (spread_compra << 0), vende se está
+        # "caro" (spread_venda >> 0), zera quando o spread volta a 0.
+        th = float(spec[1])
+
+        def rule(obs):
+            pos = obs[2]
+            if obs[0] < -th:
+                return 1
+            if obs[1] > th:
+                return 2
+            if pos > 0 and obs[0] < 0:
+                return 1   # segura a compra até o spread voltar a >= 0
+            if pos < 0 and obs[1] > 0:
+                return 2   # segura a venda até o spread voltar a <= 0
+            return 0
+        return rule
+    raise ValueError(f"policy spec desconhecida: {spec}")
+
+
+def _run_day(order, spec, model, mean, std, fee, record_equity):
+    df = process_day_cached(order)
+    feat = apply_scaler(build_state_features(df), mean, std)
+    env = ArbitrageTradingEnv(df, feat, transaction_fee=fee, record_equity=record_equity)
+    policy = _make_policy(spec, model, order)
+
+    obs, _ = env.reset()
+    done = False
+    while not done:
+        obs, _, terminated, truncated, _ = env.step(policy(obs))
+        done = terminated or truncated
+
+    n_ticks = max(env.t, 1)
+    dt = pd.to_datetime(df['datahora'])
+    hours = dt.dt.hour.to_numpy()
+    close_ticks = np.minimum(np.array(env.trade_close_ticks, dtype=int), len(df) - 1)
+    equity = None
+    max_dd = float('nan')
+    if env.equity is not None:
+        eq = np.array(env.equity)
+        max_dd = float(np.max(np.maximum.accumulate(eq) - eq)) if len(eq) else 0.0
+        equity = eq[::50].tolist()
+    return {
+        "order": int(order),
+        "date": str(dt.iloc[0].date()),
+        "pnl": float(env.total_reward),
+        "gross_mtm": float(env.gross_mtm),
+        "cost": float(env.gross_mtm - env.total_reward),
+        "n_trades": int(env.n_trades_closed),
+        "n_wins": int(env.n_trades_won),
+        "pct_long": env.ticks_long / n_ticks,
+        "pct_short": env.ticks_short / n_ticks,
+        "pct_flat": 1.0 - (env.ticks_long + env.ticks_short) / n_ticks,
+        "mean_duration": float(np.mean(env.trade_durations)) if env.trade_durations else 0.0,
+        "max_drawdown": max_dd,
+        "n_ticks": int(n_ticks),
+        "trade_pnls": [float(x) for x in env.trade_pnls],
+        "trade_hours": [int(h) for h in hours[close_ticks]] if len(close_ticks) else [],
+        "trade_durations": [int(x) for x in env.trade_durations],
+        "equity": equity,
+    }
+
+
+def _eval_day_worker(args):
+    order, record_equity = args
+    return _run_day(order, _EVAL["spec"], _EVAL["model"], _EVAL["mean"],
+                    _EVAL["std"], _EVAL["fee"], record_equity)
+
+
+def run_policy_on_days(spec, orders, mean, std, fee=2.5, n_workers=None, record_equity=False):
+    """Roda uma política ('model', path) / ('flat',) / ('random', seed) /
+    ('threshold', z) em cada pregão de `orders`, em paralelo. Retorna uma
+    lista de dicts (um por dia, na ordem de `orders`)."""
+    orders = list(orders)
+    n_workers = min(n_workers or _n_pool_workers(), len(orders))
+    if n_workers <= 1:
+        _eval_init(spec, mean, std, fee)
+        return [_eval_day_worker((o, record_equity)) for o in orders]
+    with _mp_context().Pool(n_workers, initializer=_eval_init,
+                            initargs=(spec, mean, std, fee)) as pool:
+        return pool.map(_eval_day_worker, [(o, record_equity) for o in orders], chunksize=1)
+
+
+def summarize_days(day_results):
+    """Resumo agregado (dict) de uma lista de resultados por dia."""
+    pnl = np.array([d["pnl"] for d in day_results])
+    n_trades = int(sum(d["n_trades"] for d in day_results))
+    n_wins = int(sum(d["n_wins"] for d in day_results))
+    daily_std = float(pnl.std(ddof=1)) if len(pnl) > 1 else float('nan')
+    sharpe = float(pnl.mean() / daily_std * np.sqrt(252)) if daily_std and daily_std > 0 else float('nan')
+    cum = np.cumsum(pnl)
+    max_dd_days = float(np.max(np.maximum.accumulate(cum) - cum)) if len(cum) else 0.0
+    return {
+        "n_days": len(day_results),
+        "pnl_total": float(pnl.sum()),
+        "pnl_total_brl": float(pnl.sum() * POINT_VALUE_BRL),
+        "pnl_mean_day": float(pnl.mean()),
+        "pnl_std_day": daily_std,
+        "sharpe_daily_annualized": sharpe,
+        "max_drawdown_daily_cum": max_dd_days,
+        "gross_mtm_total": float(sum(d["gross_mtm"] for d in day_results)),
+        "cost_total": float(sum(d["cost"] for d in day_results)),
+        "n_trades": n_trades,
+        "trades_per_day": n_trades / max(len(day_results), 1),
+        "win_rate": n_wins / max(n_trades, 1),
+        "pct_long": float(np.mean([d["pct_long"] for d in day_results])),
+        "pct_short": float(np.mean([d["pct_short"] for d in day_results])),
+        "pct_flat": float(np.mean([d["pct_flat"] for d in day_results])),
+        "mean_trade_duration_ticks": float(np.mean(
+            [x for d in day_results for x in d["trade_durations"]] or [0.0])),
+    }
+
+
+def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
+                     n_workers=None, verbose=True):
+    """Avalia uma política em `orders`, imprime o resumo e (se `out_dir`)
+    grava `<label>_days.csv`, `<label>_trades.csv` e `<label>_equity.csv`.
+    Retorna o dict de resumo."""
+    days = run_policy_on_days(spec, orders, mean, std, fee=fee,
+                              n_workers=n_workers, record_equity=out_dir is not None)
+    summ = summarize_days(days)
+
+    if verbose:
+        print(f"\n--- {label} (fee={fee}) ---")
+        print(f"Dias: {summ['n_days']}  |  P/L total: {summ['pnl_total']:.1f} pts "
+              f"(R$ {summ['pnl_total_brl']:.2f})  |  média/dia: {summ['pnl_mean_day']:.1f} "
+              f"(desvio {summ['pnl_std_day']:.1f})  |  Sharpe diário anualizado: "
+              f"{summ['sharpe_daily_annualized']:.2f}")
+        print(f"Negócios: {summ['n_trades']} ({summ['trades_per_day']:.1f}/dia)  |  "
+              f"taxa de acerto: {summ['win_rate']:.1%}  |  P/L bruto: "
+              f"{summ['gross_mtm_total']:.1f}  |  custos: {summ['cost_total']:.1f}")
+        print(f"Tempo comprado/vendido/flat: {summ['pct_long']:.1%} / "
+              f"{summ['pct_short']:.1%} / {summ['pct_flat']:.1%}  |  duração média "
+              f"do negócio: {summ['mean_trade_duration_ticks']:.0f} ticks")
+
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        day_cols = ["order", "date", "pnl", "gross_mtm", "cost", "n_trades", "n_wins",
+                    "pct_long", "pct_short", "pct_flat", "mean_duration",
+                    "max_drawdown", "n_ticks"]
+        pd.DataFrame([{k: d[k] for k in day_cols} for d in days]).to_csv(
+            os.path.join(out_dir, f"{label}_days.csv"), index=False)
+        trade_rows = [
+            {"order": d["order"], "date": d["date"], "hour_close": h,
+             "pnl": p, "duration_ticks": du}
+            for d in days
+            for p, h, du in zip(d["trade_pnls"], d["trade_hours"], d["trade_durations"])
+        ]
+        pd.DataFrame(trade_rows, columns=["order", "date", "hour_close", "pnl",
+                                           "duration_ticks"]).to_csv(
+            os.path.join(out_dir, f"{label}_trades.csv"), index=False)
+        eq_rows, base = [], 0.0
+        for d in days:
+            for k, v in enumerate(d["equity"] or []):
+                eq_rows.append({"order": d["order"], "tick": k * 50, "equity": base + v})
+            base += d["pnl"]
+        pd.DataFrame(eq_rows, columns=["order", "tick", "equity"]).to_csv(
+            os.path.join(out_dir, f"{label}_equity.csv"), index=False)
+
+        # distribuição de P/L por negócio (todos, não só percentis)
+        pnls = np.array([p for d in days for p in d["trade_pnls"]])
+        if len(pnls):
+            wins, losses = pnls[pnls > 0], pnls[pnls <= 0]
+            print(f"P/L por negócio: ganho médio {wins.mean() if len(wins) else 0:.2f} | "
+                  f"perda média {losses.mean() if len(losses) else 0:.2f} | "
+                  + " ".join(f"p{q}={np.percentile(pnls, q):.2f}" for q in (1, 5, 50, 95, 99)))
+    return summ
+
+
+# --------------------------------------------------------------------------
+# 6) TREINO (PPO) EM CHUNKS -- estado/checkpoints/logs em runs/<tag>/fold<N>/
+# --------------------------------------------------------------------------
+
+RUNS_DIR = os.environ.get("RUNS_DIR", "runs")
+
+
+def fold_run_dir(run_tag, fold_num):
+    d = os.path.join(RUNS_DIR, run_tag, f"fold{fold_num}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _new_state():
+    return {"num_timesteps": 0, "done": False, "best_val_score": None,
+            "best_val_steps": None, "chunks": []}
+
+
+def read_state(run_dir):
+    import json
+    path = os.path.join(run_dir, "state.json")
+    if os.path.exists(path):
+        with open(path) as fh:
+            return json.load(fh)
+    return _new_state()
+
+
+def write_state(run_dir, state):
+    import json
+    tmp = os.path.join(run_dir, "state.json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, os.path.join(run_dir, "state.json"))
+
+
+def ppo_hparams_from_env():
+    """Hiperparâmetros PPO, sobrescrevíveis por env var (ficam gravados em
+    metadata.json). gamma=0.999999: com episódio de ~27,7k ticks, desconta
+    só ~2,7% até o fim do dia (0.999 zerava o fim do pregão)."""
+    return {
+        "learning_rate": float(os.environ.get("LEARNING_RATE", "3e-4")),
+        "n_steps": int(os.environ.get("N_STEPS", "2048")),
+        "batch_size": int(os.environ.get("BATCH_SIZE", "1024")),
+        "n_epochs": int(os.environ.get("N_EPOCHS", "10")),
+        "gamma": float(os.environ.get("GAMMA", "0.999999")),
+        "gae_lambda": float(os.environ.get("GAE_LAMBDA", "0.95")),
+        "ent_coef": float(os.environ.get("ENT_COEF", "0.0")),
+    }
+
+
+def write_metadata(run_dir, fold, hparams, extra):
+    import json
+    import platform
+    import subprocess
+    import stable_baselines3
+    try:
+        git_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True,
+                                           stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        git_hash = None
+    meta = {
+        "git_hash": git_hash,
+        "hparams": hparams,
+        "fold": fold["fold"],
+        "train_orders": {"first": fold["train_orders"][0], "last": fold["train_orders"][-1],
+                         "n": len(fold["train_orders"])},
+        "val_orders": fold["val_orders"],
+        "test_orders": fold["test_orders"],
+        "total_timesteps": fold["total_timesteps"],
+        "versions": {"python": platform.python_version(), "numpy": np.__version__,
+                     "pandas": pd.__version__, "torch": torch.__version__,
+                     "stable_baselines3": stable_baselines3.__version__,
+                     "gymnasium": gym.__version__},
+        "state_features": STATE_FEATURE_NAMES + ["posicao", "pl_nao_realizado_norm"],
+        **extra,
+    }
+    with open(os.path.join(run_dir, "metadata.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+
+def _day_features(order):
+    return build_state_features(process_day_cached(order))
+
+
+def load_or_fit_scaler(run_dir, train_orders, n_workers):
+    """Scaler (mean/std) só do treino, salvo em scaler.npz -- os chunks
+    seguintes e o job de avaliação reusam o MESMO arquivo em vez de
+    reprocessar todos os dias de treino (que custava ~1-3 min por chunk)."""
+    path = os.path.join(run_dir, "scaler.npz")
+    if os.path.exists(path):
+        z = np.load(path)
+        return z["mean"], z["std"]
+    n_workers = max(1, min(n_workers, len(train_orders)))
+    if n_workers == 1:
+        feats = [_day_features(o) for o in train_orders]
+    else:
+        with _mp_context().Pool(n_workers) as pool:
+            feats = pool.map(_day_features, train_orders, chunksize=1)
+    mean, std = fit_feature_scaler(feats)
+    np.savez(path, mean=mean, std=std)
+    return mean, std
+
+
+class ValidationCallback(BaseCallback):
+    """Avalia a política DETERMINÍSTICA em validação (e num subconjunto fixo
+    de dias de treino, pra curva treino-vs-validação comparável) a cada
+    `eval_every_steps` timesteps, grava val_curve.csv e mantém o MELHOR
+    checkpoint de validação entre chunks (ppo_best_val.zip + state.json).
+
+    Seleção de checkpoint usa SÓ validação; o teste não é tocado aqui.
+    """
+
+    def __init__(self, run_dir, val_orders, train_subset, mean, std, fee,
+                 eval_every_steps, deadline=None, verbose=1):
+        super().__init__(verbose)
+        self.run_dir = run_dir
+        self.val_orders = val_orders
+        self.train_subset = train_subset
+        self.mean, self.std, self.fee = mean, std, fee
+        self.eval_every = eval_every_steps
+        self.deadline = deadline
+        self.next_eval = None
+        self.total_eval_seconds = 0.0
+
+    def _on_training_start(self):
+        self.next_eval = (self.num_timesteps // self.eval_every + 1) * self.eval_every
+
+    def _on_step(self):
+        if self.num_timesteps < self.next_eval:
+            return True
+        if self.deadline is not None and self.deadline - time.time() < 240:
+            return True  # sem tempo seguro: adia pra o próximo chunk
+        self.next_eval += self.eval_every
+        self._evaluate()
+        return True
+
+    def _evaluate(self):
+        tmp = os.path.join(self.run_dir, "_eval_tmp.zip")
+        self.model.save(tmp)
+        t0 = time.time()
+        val = summarize_days(run_policy_on_days(("model", tmp), self.val_orders,
+                                                self.mean, self.std, self.fee))
+        trn = summarize_days(run_policy_on_days(("model", tmp), self.train_subset,
+                                                self.mean, self.std, self.fee))
+        row = {"timesteps": self.num_timesteps,
+               "val_pnl_total": val["pnl_total"], "val_pnl_mean_day": val["pnl_mean_day"],
+               "val_trades_per_day": val["trades_per_day"], "val_win_rate": val["win_rate"],
+               "val_pct_flat": val["pct_flat"],
+               "train_subset_pnl_mean_day": trn["pnl_mean_day"],
+               "train_subset_trades_per_day": trn["trades_per_day"],
+               "eval_seconds": time.time() - t0}
+        self.total_eval_seconds += row["eval_seconds"]
+        path = os.path.join(self.run_dir, "val_curve.csv")
+        pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+        if self.verbose:
+            print(f"[Validação @ {self.num_timesteps:,}] P/L val {val['pnl_total']:.1f} pts "
+                  f"({val['trades_per_day']:.1f} negócios/dia) | treino(sub) "
+                  f"{trn['pnl_mean_day']:.1f}/dia | {row['eval_seconds']:.0f}s")
+
+        state = read_state(self.run_dir)
+        if state["best_val_score"] is None or val["pnl_total"] > state["best_val_score"]:
+            os.replace(tmp, os.path.join(self.run_dir, "ppo_best_val.zip"))
+            state["best_val_score"] = val["pnl_total"]
+            state["best_val_steps"] = int(self.num_timesteps)
+            write_state(self.run_dir, state)
+            if self.verbose:
+                print("  -> novo melhor checkpoint de validação")
+        elif os.path.exists(tmp):
+            os.remove(tmp)
+
+
+class TradeStatsCallback(BaseCallback):
+    """Registra no logger do SB3 quantos negócios por episódio o agente faz
+    durante o TREINO (sinal de degeneração: a política ruim do sweep fazia
+    ~7 mil negócios/dia)."""
+
+    def __init__(self):
+        super().__init__(0)
+        self._trades, self._wins = [], []
+
+    def _on_step(self):
+        for done, info in zip(self.locals["dones"], self.locals["infos"]):
+            if done:
+                self._trades.append(info.get("n_trades_closed", 0))
+                self._wins.append(info.get("n_trades_won", 0))
+        return True
+
+    def _on_rollout_end(self):
+        if self._trades:
+            self.logger.record("train/trades_per_episode", float(np.mean(self._trades)))
+            self.logger.record("train/win_rate_episode",
+                               float(np.sum(self._wins) / max(np.sum(self._trades), 1)))
+            self._trades, self._wins = [], []
+
+
+def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds=None,
+                resume=False, chunk_index=1, eval_every_steps=4_000_000,
+                ckpt_every_steps=3_000_000):
+    """Treina até `fold['total_timesteps']` OU até o deadline de tempo,
+    o que vier primeiro, e atualiza state.json (`done` quando o alvo foi
+    atingido). Chamado uma vez por job Slurm; o próximo chunk retoma de
+    ppo_last.zip."""
+    from stable_baselines3.common.callbacks import CheckpointCallback
+
+    n_train_envs = int(os.environ.get("N_TRAIN_ENVS") or _detect_n_train_envs())
+    mean, std = load_or_fit_scaler(run_dir, fold["train_orders"], _n_pool_workers())
+
+    model_path = os.path.join(run_dir, "ppo_last.zip")
+    resume = resume and os.path.exists(model_path)
+    if not resume:
+        write_state(run_dir, _new_state())
+        write_metadata(run_dir, fold, hparams, {"seed": seed, "transaction_fee": transaction_fee,
+                                                 "n_train_envs": n_train_envs,
+                                                 "vec_env": os.environ.get("VEC_ENV", "dummy"),
+                                                 "torch_threads": torch.get_num_threads()})
+
+    train_env_fns = [
+        partial(_make_multiday_env, fold["train_orders"], mean, std,
+                transaction_fee, None, seed * 1000 + i)
+        for i in range(n_train_envs)
+    ]
+    # DummyVecEnv (tudo num processo) x SubprocVecEnv (1 processo por env):
+    # com o env de 4 dimensões o step custa ~4 µs, então o IPC do
+    # SubprocVecEnv domina e o DummyVecEnv foi ~2x mais rápido no teste
+    # local. Confirmar no nó com slurm/benchmark_throughput.sbatch
+    # (VEC_ENV=subproc|dummy).
+    vec_kind = os.environ.get("VEC_ENV", "dummy")
+    vec_env = (DummyVecEnv if vec_kind == "dummy" else SubprocVecEnv)(train_env_fns)
+    print(f"VecEnv: {vec_kind} com {n_train_envs} envs | torch threads: {torch.get_num_threads()}")
+
+    if resume:
+        print(f"Retomando treino a partir de '{model_path}'.")
+        model = PPO.load(model_path, env=vec_env)
+    else:
+        model = PPO("MlpPolicy", vec_env, seed=seed, verbose=1, **hparams)
+    model.set_logger(configure_logger(os.path.join(run_dir, "logs", f"chunk{chunk_index}"),
+                                      ["stdout", "csv"]))
+
+    n_start = int(model.num_timesteps)
+    remaining = max(int(fold["total_timesteps"]) - n_start, 0)
+    deadline = (SCRIPT_START + max_seconds) if max_seconds is not None else None
+
+    # subconjunto FIXO de dias de treino, avaliado com a mesma política
+    # determinística usada em validação (curva treino-vs-validação
+    # comparável; ep_rew_mean do treino é estocástico e não é comparável)
+    step = max(1, len(fold["train_orders"]) // 10)
+    train_subset = fold["train_orders"][::step][:10]
+
+    val_cb = ValidationCallback(run_dir, fold["val_orders"], train_subset, mean, std,
+                                transaction_fee, eval_every_steps, deadline)
+    callbacks = [
+        val_cb,
+        TradeStatsCallback(),
+        CheckpointCallback(save_freq=max(1, ckpt_every_steps // n_train_envs),
+                           save_path=os.path.join(run_dir, "checkpoints"),
+                           name_prefix="ckpt"),
+    ]
+    if deadline is not None:
+        callbacks.append(TimeLimitCallback(deadline, verbose=1))
+
+    t_learn = time.time()
+    if remaining > 0:
+        model.learn(total_timesteps=remaining, callback=CallbackList(callbacks),
+                    reset_num_timesteps=not resume)
+    learn_seconds = time.time() - t_learn
+    train_seconds = max(learn_seconds - val_cb.total_eval_seconds, 1e-9)
+    model.save(model_path)
+    vec_env.close()
+
+    state = read_state(run_dir)  # ValidationCallback pode ter atualizado o best
+    n_end = int(model.num_timesteps)
+    state["num_timesteps"] = n_end
+    state["done"] = n_end >= int(fold["total_timesteps"])
+    state["chunks"].append({
+        "chunk": chunk_index, "start_steps": n_start, "end_steps": n_end,
+        "learn_seconds": round(learn_seconds, 1),
+        "eval_seconds": round(val_cb.total_eval_seconds, 1),
+        "startup_seconds": round(t_learn - SCRIPT_START, 1),
+        # steps/s SEM contar o tempo das validações periódicas
+        "steps_per_sec": round((n_end - n_start) / train_seconds, 1),
+    })
+    write_state(run_dir, state)
+    print(f"\n=== Chunk {chunk_index}: {n_start:,} -> {n_end:,} / "
+          f"{fold['total_timesteps']:,} timesteps | done={state['done']} | "
+          f"{state['chunks'][-1]['steps_per_sec']:.0f} steps/s ===")
+    return state
+
+
+# --------------------------------------------------------------------------
+# 7) JOB DE AVALIAÇÃO (val+teste do melhor-de-validação e do último modelo,
+#    baselines, sensibilidade a custo, curva de checkpoints)
+# --------------------------------------------------------------------------
+
+def run_eval_job(fold, run_dir, fee=2.5, job_hard_seconds=None):
+    import glob
+    import re
+    mean, std = load_or_fit_scaler(run_dir, fold["train_orders"], _n_pool_workers())
+    out_dir = os.path.join(run_dir, "eval")
+    os.makedirs(out_dir, exist_ok=True)
+    deadline = (SCRIPT_START + job_hard_seconds) if job_hard_seconds else None
+    summary_path = os.path.join(out_dir, "summary.csv")
+    if os.path.exists(summary_path):
+        os.remove(summary_path)
+
+    def has_time(needed):
+        return deadline is None or deadline - time.time() > needed
+
+    def record(label, model_name, set_name, fee_used, summ):
+        row = {"label": label, "model": model_name, "set": set_name, "fee": fee_used, **summ}
+        pd.DataFrame([row]).to_csv(summary_path, mode="a",
+                                   header=not os.path.exists(summary_path), index=False)
+
+    sets = {"val": fold["val_orders"], "test": fold["test_orders"]}
+    models = {}
+    for name, fname in (("best_val", "ppo_best_val.zip"), ("last", "ppo_last.zip")):
+        path = os.path.join(run_dir, fname)
+        if os.path.exists(path):
+            models[name] = path
+
+    # 1) modelos principais (fee de treino)
+    for mname, mpath in models.items():
+        for sname, orders in sets.items():
+            if not has_time(120):
+                print(f"[eval] sem tempo para {mname}/{sname}; pulando")
+                continue
+            label = f"{mname}_{sname}_fee{fee}"
+            record(label, mname, sname, fee,
+                   evaluate_and_log(label, ("model", mpath), orders, mean, std,
+                                    fee=fee, out_dir=out_dir))
+
+    # 2) baselines
+    for bname, spec in (("flat", ("flat",)), ("threshold1.0", ("threshold", 1.0)),
+                        ("random", ("random", 0))):
+        for sname, orders in sets.items():
+            if not has_time(120):
+                continue
+            label = f"baseline_{bname}_{sname}_fee{fee}"
+            record(label, f"baseline_{bname}", sname, fee,
+                   evaluate_and_log(label, spec, orders, mean, std, fee=fee, out_dir=out_dir))
+
+    # 3) sensibilidade a custo do melhor-de-validação
+    ref_name = "best_val" if "best_val" in models else ("last" if "last" in models else None)
+    if ref_name:
+        for fee_alt in (0.0, 0.5):
+            for sname, orders in sets.items():
+                if not has_time(120):
+                    continue
+                label = f"cost_sens_{sname}_fee{fee_alt}"
+                record(label, ref_name, sname, fee_alt,
+                       evaluate_and_log(label, ("model", models[ref_name]), orders, mean, std,
+                                        fee=fee_alt, out_dir=out_dir))
+
+    # 4) curva de checkpoints em val e teste (SÓ para relatório, não seleciona nada)
+    curve_path = os.path.join(out_dir, "checkpoint_curve.csv")
+    if os.path.exists(curve_path):
+        os.remove(curve_path)
+    ckpts = sorted(glob.glob(os.path.join(run_dir, "checkpoints", "ckpt_*_steps.zip")),
+                   key=lambda p: int(re.search(r"ckpt_(\d+)_steps", p).group(1)))
+    for ck in ckpts:
+        if not has_time(150):
+            print("[eval] sem tempo para o resto da curva de checkpoints")
+            break
+        steps = int(re.search(r"ckpt_(\d+)_steps", ck).group(1))
+        row = {"timesteps": steps}
+        for sname, orders in sets.items():
+            summ = summarize_days(run_policy_on_days(("model", ck), orders, mean, std, fee))
+            row.update({f"{sname}_pnl_total": summ["pnl_total"],
+                        f"{sname}_trades_per_day": summ["trades_per_day"],
+                        f"{sname}_win_rate": summ["win_rate"]})
+        pd.DataFrame([row]).to_csv(curve_path, mode="a",
+                                   header=not os.path.exists(curve_path), index=False)
+        print(f"[curva] {steps:,}: val {row['val_pnl_total']:.1f} | teste {row['test_pnl_total']:.1f}")
 
 
 # --------------------------------------------------------------------------
@@ -870,136 +1454,57 @@ def evaluate_policy(model, orders, mean, std, n_ticks=120):
 
 if __name__ == "__main__":
     all_orders = list(range(1, 481))  # 480 pregões disponíveis, em ordem cronológica
-
-    # MAX_PREGOES limita quantos pregões (do início, cronologicamente)
-    # usar -- útil pra rodadas menores/mais rápidas sem esperar os 68
-    # chunks que os 480 pregões completos exigem com TARGET_N_PASSADAS=20
-    # (ver conversa: escala escolhida por enquanto é usar bem menos que
-    # os 480 disponíveis). Sem a env var, usa todos.
     max_pregoes = os.environ.get("MAX_PREGOES")
     if max_pregoes:
         all_orders = all_orders[:int(max_pregoes)]
 
-    N_FOLDS = 3  # configurável: quantos folds walk-forward gerar
+    run_tag = os.environ.get("RUN_TAG", "v4")
+    seed = int(os.environ.get("SEED", "0"))
+    fee = float(os.environ.get("TRANSACTION_FEE", "2.5"))
+    train_sizes = tuple(int(x) for x in os.environ.get("TRAIN_SIZES", "100,150,200").split(","))
 
-    # Lidos de env var pra permitir recalibrar sem editar código -- em
-    # especial THROUGHPUT_STEPS_PER_SEC, que deve ser remedido no node
-    # real do Santos Dumont (o default foi medido no PC doméstico) antes
-    # de confiar no n_chunks_needed calculado abaixo pros folds maiores.
-    target_n_passadas = float(os.environ.get("TARGET_N_PASSADAS", "20.0"))
-    throughput_steps_per_sec = float(os.environ.get("THROUGHPUT_STEPS_PER_SEC", "4209.0"))
-
-    # RUN_TAG: sufixo pra não colidir artefatos (checkpoint, best_model,
-    # log CSV) entre rodadas diferentes com o MESMO fold (ex.: um sweep de
-    # TARGET_N_PASSADAS) -- sem a env var, "" reproduz os caminhos de
-    # sempre (compatível com v1/v2). CHUNK_INDEX só nomeia o subdiretório
-    # de log CSV por chunk, pra um chunk não sobrescrever o CSV do
-    # anterior na mesma cadeia de resume.
-    run_tag = os.environ.get("RUN_TAG", "")
-    tag_suffix = f"_{run_tag}" if run_tag else ""
-    chunk_index = os.environ.get("CHUNK_INDEX", "1")
-    if run_tag:
-        print(f"RUN_TAG={run_tag}  CHUNK_INDEX={chunk_index}")
-
-    folds = generate_walk_forward_folds(
-        all_orders, n_folds=N_FOLDS,
-        target_n_passadas=target_n_passadas,
-        throughput_steps_per_sec=throughput_steps_per_sec,
+    folds = generate_fixed_window_folds(
+        all_orders,
+        train_sizes=train_sizes,
+        n_val=int(os.environ.get("N_VAL", "15")),
+        n_test=int(os.environ.get("N_TEST", "15")),
+        total_timesteps=int(float(os.environ.get("TOTAL_TIMESTEPS", "30000000"))),
+        throughput_steps_per_sec=float(os.environ.get("THROUGHPUT_STEPS_PER_SEC", "5500")),
+        chunk_seconds=float(os.environ.get("CHUNK_SECONDS", "1050")),
     )
 
-    # Modo usado por slurm/submit_all_folds.sh pra descobrir quantos
-    # chunks de 20min encadear POR FOLD (n_chunks_needed varia por fold,
-    # ver generate_walk_forward_folds) sem duplicar essa conta em bash --
-    # imprime "<fold> <n_chunks_needed>" por linha e sai, sem treinar nada.
+    # slurm/submit_all_folds.sh usa isto pra estimar quantos chunks encadear
     if os.environ.get("PRINT_FOLD_PLAN") == "1":
         for f in folds:
             print(f"{f['fold']} {f['n_chunks_needed']}")
         raise SystemExit(0)
 
-    # Recuperação: roda SÓ a avaliação (val+teste) de um fold já treinado,
-    # carregando o checkpoint salvo em vez de retreinar -- útil quando
-    # run_eval_if_time_allows() pulou uma avaliação por falta de reserva
-    # de tempo (o checkpoint já estava salvo, só o relatório se perdeu).
-    eval_only_fold = os.environ.get("EVAL_ONLY_FOLD")
-    if eval_only_fold:
-        fold_num = int(eval_only_fold)
-        f = next(ff for ff in folds if ff["fold"] == fold_num)
-        train_feats = [build_feature_matrix(process_day(o)) for o in f["train_orders"]]
-        mean, std = fit_feature_scaler(train_feats)
-        model_path = f"ppo_arbitrage_fold{fold_num}{tag_suffix}.zip"
-        print(f"\n########## FOLD {fold_num} -- AVALIAÇÃO ISOLADA (checkpoint: {model_path}) ##########")
-        model = PPO.load(model_path)
-        print(f"\n=== Fold {fold_num} -- Avaliação em VALIDAÇÃO ===")
-        evaluate_policy(model, f["val_orders"], mean, std)
-        print(f"\n=== Fold {fold_num} -- Avaliação em TESTE ===")
-        evaluate_policy(model, f["test_orders"], mean, std)
-        raise SystemExit(0)
+    fold_sel = os.environ.get("SLURM_ARRAY_TASK_ID") or os.environ.get("FOLD")
+    folds_to_run = [f for f in folds if f["fold"] == int(fold_sel)] if fold_sel else folds
 
-    # Sob Slurm job array (--array=1-N_FOLDS), cada task treina só o fold
-    # correspondente ao seu índice, em vez de rodar os N_FOLDS em
-    # sequência no mesmo job -- assim os folds treinam em paralelo, um
-    # por nó. Em execução local (sem Slurm), a env var não existe e o
-    # comportamento antigo (todos os folds em sequência) é preservado.
-    array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
-    folds_to_run = [f for f in folds if f["fold"] == int(array_task_id)] if array_task_id else folds
-
-    # Margem de segurança sob o --time do job Slurm (ver TimeLimitCallback);
-    # setado pelo .sbatch. Sem essa env var (execução local), sem limite.
     max_seconds = os.environ.get("TRAIN_MAX_SECONDS")
     max_seconds = float(max_seconds) if max_seconds else None
-
-    # Deadline duro do job inteiro (contado a partir de SCRIPT_START,
-    # igual ao TimeLimitCallback). O evaluate_policy() de validação/teste
-    # roda DEPOIS do model.learn() já ter parado e salvo o modelo -- sem
-    # essa checagem, um smoke test real mostrou que o Slurm mata o job no
-    # meio dessa avaliação (o modelo fica salvo, mas o relatório de
-    # validação/teste se perde). Se não sobrar reserva suficiente, PULA a
-    # avaliação em vez de arriscar ser matado no meio -- o checkpoint já
-    # está salvo, então dá pra rodar evaluate_policy() depois carregando
-    # ele, sem precisar retreinar.
-    job_hard_seconds = os.environ.get("JOB_HARD_SECONDS")
-    job_hard_deadline = (SCRIPT_START + float(job_hard_seconds)) if job_hard_seconds else None
-    EVAL_RESERVE_SECONDS = 150  # reserva conservadora por chamada de evaluate_policy
-
-    def run_eval_if_time_allows(fold_num, label, orders, model, mean, std):
-        if job_hard_deadline is not None:
-            remaining = job_hard_deadline - time.time()
-            if remaining < EVAL_RESERVE_SECONDS:
-                print(f"\n=== Fold {fold_num} -- Avaliação em {label} PULADA "
-                      f"({remaining:.0f}s restantes, menos que a reserva de "
-                      f"{EVAL_RESERVE_SECONDS}s) -- o checkpoint já está "
-                      f"salvo; rode evaluate_policy() depois carregando-o. ===")
-                return
-        print(f"\n=== Fold {fold_num} -- Avaliação em {label} ===")
-        evaluate_policy(model, orders, mean, std)
-
-    # Treino em chunks: RESUME_TRAINING=1 retoma do checkpoint do fold
-    # (job anterior na mesma cadeia) em vez de treinar do zero;
-    # FINAL_CHUNK=0 pula a avaliação de val/teste (ainda vai treinar mais
-    # depois). Sem essas env vars (execução local ou job único), o
-    # default preserva o comportamento de sempre: treina do zero e avalia
-    # ao final -- ver slurm/submit_all_folds.sh pra como isso é orquestrado.
-    resume_training = os.environ.get("RESUME_TRAINING", "0") == "1"
-    final_chunk = os.environ.get("FINAL_CHUNK", "1") == "1"
+    job_hard = os.environ.get("JOB_HARD_SECONDS")
+    job_hard = float(job_hard) if job_hard else None
+    hparams = ppo_hparams_from_env()
+    print(f"Hiperparâmetros PPO: {hparams}")
 
     for f in folds_to_run:
-        print(f"\n########## FOLD {f['fold']}/{len(folds)} ##########")
-        model_path = f"ppo_arbitrage_fold{f['fold']}{tag_suffix}.zip"
-        run_label = run_tag or "default"
-        log_dir = f"logs/{run_label}/fold{f['fold']}/chunk{chunk_index}"
-        model, (mean, std) = train_ppo(
-            f["train_orders"], f["val_orders"],
-            total_timesteps=f["total_timesteps"],
-            model_path=model_path,
-            best_model_dir=f"./best_model_fold{f['fold']}{tag_suffix}",
-            max_seconds=max_seconds,
-            resume_from=(model_path if resume_training else None),
-            log_dir=log_dir,
-        )
+        print(f"\n########## FOLD {f['fold']}/{len(folds)} (RUN_TAG={run_tag}) ##########")
+        run_dir = fold_run_dir(run_tag, f["fold"])
 
-        if final_chunk:
-            run_eval_if_time_allows(f["fold"], "VALIDAÇÃO", f["val_orders"], model, mean, std)
-            run_eval_if_time_allows(f["fold"], "TESTE", f["test_orders"], model, mean, std)
-        else:
-            print(f"\n=== Fold {f['fold']} -- chunk intermediário, avaliação "
-                  f"fica pro chunk final (FINAL_CHUNK=1) ===")
+        if os.environ.get("RUN_EVAL") == "1":
+            run_eval_job(f, run_dir, fee=fee, job_hard_seconds=job_hard)
+            continue
+
+        state = train_chunk(
+            f, run_dir, hparams, seed=seed, transaction_fee=fee,
+            max_seconds=max_seconds,
+            resume=os.environ.get("RESUME_TRAINING", "0") == "1",
+            chunk_index=int(os.environ.get("CHUNK_INDEX", "1")),
+            eval_every_steps=int(float(os.environ.get("EVAL_EVERY_STEPS", "4000000"))),
+            ckpt_every_steps=int(float(os.environ.get("CKPT_EVERY_STEPS", "3000000"))),
+        )
+        # execução local (sem limite de job): avalia direto ao terminar
+        if state["done"] and job_hard is None:
+            run_eval_job(f, run_dir, fee=fee)

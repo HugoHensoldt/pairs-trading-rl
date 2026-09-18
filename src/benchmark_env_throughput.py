@@ -1,103 +1,101 @@
 """
-Benchmark de throughput do ArbitrageTradingEnv.
+Benchmark de throughput da v4 (estado de 4 dimensões).
 
-Script standalone (não altera o pipeline principal). Constrói o ambiente
-para 1-2 pregões de exemplo, roda um número fixo de steps com ações
-aleatórias medindo o tempo de parede, e imprime steps/segundo.
-
-Com base no throughput medido, estima quantos total_timesteps cabem em
-uma janela de treino de N horas -- considerando o paralelismo que o
-ambiente JÁ suporta hoje (verificado no pipeline: train_ppo() usa
-DummyVecEnv([make_train_env]) com uma única função de ambiente, ou seja,
-1 ambiente único, sem paralelismo de processos -- ver
-rl_trading_pipeline.py). O DummyVecEnv roda os ambientes sequencialmente
-na mesma thread, então o throughput agregado hoje é simplesmente o
-throughput de 1 ambiente.
+Dois números:
+  1) `env`: steps/s do ArbitrageTradingEnv sozinho (1 processo, ações
+     aleatórias) -- só o custo do ambiente.
+  2) `ppo`: steps/s REAIS de treino (SubprocVecEnv com N processos + rede +
+     atualizações do PPO) -- é o que dimensiona TOTAL_TIMESTEPS e o número de
+     chunks. Esse número precisa ser medido no NÓ do Santos Dumont (ver
+     slurm/benchmark_throughput.sbatch); o valor do PC doméstico não vale
+     (o default antigo, 4209, foi medido no PC e o cluster deu ~5,5k na v3).
 
 Uso:
-    python src/benchmark_env_throughput.py
+    python src/benchmark_env_throughput.py            # roda os dois
+    MODE=ppo N_STEPS=2048 python src/benchmark_env_throughput.py
+    MODE=env python src/benchmark_env_throughput.py
+
+Env vars: MODE (env|ppo|both), VEC_ENV (dummy|subproc, default dummy), TORCH_THREADS, N_TRAIN_ENVS, N_STEPS/BATCH_SIZE/... (os
+mesmos hiperparâmetros PPO do pipeline), BENCH_DAYS (dias carregados por
+processo, default 5), BENCH_ROLLOUTS (rollouts medidos, default 4).
 """
 
+import os
 import time
+from functools import partial
 
 import numpy as np
 
 from rl_trading_pipeline import (
-    process_day,
-    build_feature_matrix,
+    process_day_cached,
+    build_state_features,
     fit_feature_scaler,
     apply_scaler,
     ArbitrageTradingEnv,
+    _make_multiday_env,
+    _detect_n_train_envs,
+    ppo_hparams_from_env,
 )
 
-N_STEPS = 20_000
-BENCHMARK_ORDERS = [1, 2]          # pregões de exemplo
-N_TICKS = 120                      # mesmo default usado em train_ppo()
-TRAINING_HOURS = 6.0
-N_PARALLEL_ENVS_TODAY = 1          # DummyVecEnv([make_train_env]) -> 1 env, sem SubprocVecEnv
+N_STEPS_ENV = 60_000
+BENCH_DAYS = int(os.environ.get("BENCH_DAYS", "5"))
+BENCH_ROLLOUTS = int(os.environ.get("BENCH_ROLLOUTS", "4"))
 
 
-def build_benchmark_env(orders, n_ticks=N_TICKS):
-    """Carrega os pregões de exemplo e monta um único ArbitrageTradingEnv
-    concatenando-os um após o outro (suficiente para medir custo por
-    step; não precisamos do MultiDayEnv/sorteio para este benchmark)."""
-    feats = []
-    dfs = []
-    for order in orders:
-        df = process_day(order)
-        feats.append(build_feature_matrix(df))
-        dfs.append(df)
-
-    mean, std = fit_feature_scaler(feats)
-
-    # usa só o primeiro pregão carregado para o loop de steps -- se ele
-    # não tiver ticks suficientes para N_STEPS, o benchmark reseta o
-    # ambiente (novo episódio) e continua contando steps
-    df0 = dfs[0]
-    feat0 = apply_scaler(feats[0], mean, std)
-    env = ArbitrageTradingEnv(df0, feat0, n_ticks=n_ticks)
-    return env
-
-
-def run_benchmark():
-    env = build_benchmark_env(BENCHMARK_ORDERS)
-
-    obs, _ = env.reset()
+def run_env_benchmark():
+    df = process_day_cached(1)
+    raw = build_state_features(df)
+    mean, std = fit_feature_scaler([raw])
+    env = ArbitrageTradingEnv(df, apply_scaler(raw, mean, std))
+    env.reset()
     rng = np.random.default_rng(0)
-
     start = time.perf_counter()
-    for _ in range(N_STEPS):
-        action = rng.integers(0, 3)
-        obs, reward, terminated, truncated, info = env.step(action)
+    for _ in range(N_STEPS_ENV):
+        _, _, terminated, truncated, _ = env.step(int(rng.integers(0, 3)))
         if terminated or truncated:
-            obs, _ = env.reset()
+            env.reset()
     elapsed = time.perf_counter() - start
+    return N_STEPS_ENV / elapsed
 
-    steps_per_sec = N_STEPS / elapsed
-    return steps_per_sec, elapsed
+
+def run_ppo_benchmark():
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+
+    n_envs = int(os.environ.get("N_TRAIN_ENVS") or _detect_n_train_envs())
+    orders = list(range(1, 1 + BENCH_DAYS))
+    mean, std = fit_feature_scaler([build_state_features(process_day_cached(o)) for o in orders])
+    hp = ppo_hparams_from_env()
+
+    t0 = time.perf_counter()
+    vec_cls = DummyVecEnv if os.environ.get("VEC_ENV", "dummy") == "dummy" else SubprocVecEnv
+    vec = vec_cls([partial(_make_multiday_env, orders, mean, std, 2.5, None, i)
+                   for i in range(n_envs)])
+    model = PPO("MlpPolicy", vec, seed=0, verbose=0, **hp)
+    startup = time.perf_counter() - t0
+
+    per_rollout = hp["n_steps"] * n_envs
+    model.learn(total_timesteps=per_rollout)  # aquecimento (não medido)
+    t1 = time.perf_counter()
+    model.learn(total_timesteps=per_rollout * BENCH_ROLLOUTS, reset_num_timesteps=False)
+    elapsed = time.perf_counter() - t1
+    vec.close()
+    return n_envs, per_rollout, startup, per_rollout * BENCH_ROLLOUTS / elapsed, hp
 
 
 def main():
-    print(f"Rodando benchmark: {N_STEPS} steps com ações aleatórias "
-          f"(pregões de exemplo: {BENCHMARK_ORDERS})...")
-    steps_per_sec, elapsed = run_benchmark()
-
-    print(f"\nTempo total       : {elapsed:.2f} s")
-    print(f"Steps/segundo     : {steps_per_sec:,.1f}")
-
-    print(f"\nParalelismo hoje  : {N_PARALLEL_ENVS_TODAY} ambiente "
-          f"(DummyVecEnv com uma única função de ambiente -- sem "
-          f"SubprocVecEnv no pipeline atual)")
-
-    total_seconds = TRAINING_HOURS * 3600
-    estimated_timesteps = steps_per_sec * N_PARALLEL_ENVS_TODAY * total_seconds
-
-    print(f"\nEstimativa para {TRAINING_HOURS:.0f}h de treino "
-          f"(i5 11ª geração, paralelismo atual = {N_PARALLEL_ENVS_TODAY}):")
-    print(f"  total_timesteps ~= {estimated_timesteps:,.0f}")
-    print("\n(Nota: esta estimativa conta só o custo do ambiente/step. O "
-          "tempo real de treino também inclui forward/backward do PPO, "
-          "que não é medido aqui.)")
+    mode = os.environ.get("MODE", "both")
+    if mode in ("env", "both"):
+        print(f"[env]  {run_env_benchmark():,.0f} steps/s (1 processo, sem rede)")
+    if mode in ("ppo", "both"):
+        n_envs, per_rollout, startup, sps, hp = run_ppo_benchmark()
+        print(f"[ppo]  {sps:,.0f} steps/s reais de treino com {n_envs} processos "
+              f"(rollout de {per_rollout:,} steps, startup {startup:.0f}s)")
+        print(f"       hiperparâmetros: {hp}")
+        for total in (20e6, 30e6, 40e6):
+            secs = total / sps
+            print(f"       {total/1e6:.0f}M timesteps ≈ {secs/60:.0f} min de treino "
+                  f"≈ {secs/1050:.1f} chunks de ~1050s efetivos")
 
 
 if __name__ == "__main__":
