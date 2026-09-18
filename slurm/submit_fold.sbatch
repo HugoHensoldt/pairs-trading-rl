@@ -48,8 +48,8 @@ export TICK_DATA_DIR="/scratch/ppg-lncc/$USER/tick_data"
 
 # --- qual fold / qual modo ------------------------------------------------
 # slurm/submit_all_folds.sh exporta SLURM_ARRAY_TASK_ID (fold),
-# RESUME_TRAINING/CHUNK_INDEX (treino em chunks) e RUN_EVAL (=1 para o job
-# de AVALIAÇÃO do fold, que não treina). Chamando este arquivo direto (sem
+# RESUME_TRAINING/CHUNK_INDEX (treino em chunks) e RUN_EVAL (=1/2: jobs de
+# AVALIAÇÃO do fold, que não treinam; 0 = treino). Chamando este arquivo direto (sem
 # exportar nada): fold 1, chunk 1, treina do zero, RUN_TAG=v4.
 export SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
 export RESUME_TRAINING="${RESUME_TRAINING:-0}"
@@ -75,7 +75,7 @@ export DAY_CACHE_DIR="/scratch/ppg-lncc/$USER/day_cache"
 #   modelos principais -> baselines -> sensibilidade a custo -> curva de
 #   checkpoints.
 export JOB_HARD_SECONDS=1170
-if [ "$RUN_EVAL" != "1" ]; then
+if [ "$RUN_EVAL" = "0" ]; then
     export TRAIN_MAX_SECONDS=1140
 fi
 

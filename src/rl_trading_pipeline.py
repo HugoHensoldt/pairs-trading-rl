@@ -373,7 +373,7 @@ class ArbitrageTradingEnv(gym.Env):
 
     def __init__(self, df, feature_matrix, transaction_fee=2.5,
                  reward_scale=1.0, max_loss_per_position=None,
-                 record_equity=False):
+                 record_equity=False, track_details=False):
         super().__init__()
         assert len(df) == len(feature_matrix)
         # só o tamanho do pregão é guardado (não o DataFrame): cada um dos
@@ -382,6 +382,14 @@ class ArbitrageTradingEnv(gym.Env):
         # processo sem ser usado depois de extraídos bid/ask.
         self.n_day_ticks = len(df)
         self.record_equity = record_equity
+        # track_details (só na avaliação): decompõe o P/L em convergência do
+        # spread vs componente direcional (preço justo) e guarda os
+        # detalhes de cada negócio -- fica desligado no treino pra não
+        # custar nada por step.
+        self.track_details = track_details and 'Wajusto' in df.columns
+        if self.track_details:
+            self.fair = ((df['Wajusto'] + df['Wbjusto']) / 2).to_numpy(dtype=float)
+            self.mid = (df['bid'] + df['ask']).to_numpy(dtype=float) / 2
         # bid/ask pré-extraídos como arrays numpy: evita .iloc (indexação
         # pandas) tick a tick dentro de step()/_get_obs(), que é bem mais
         # lento que indexação numpy direta.
@@ -422,6 +430,10 @@ class ArbitrageTradingEnv(gym.Env):
         self.trade_close_ticks = []        # índice do tick de fechamento de cada negócio
         self._open_tick = 0
         self.equity = [] if self.record_equity else None
+        # decomposição: gross_mtm == mtm_spread + mtm_fair (só com track_details)
+        self.mtm_spread = 0.0              # posição x variação do mispricing (mid WIN - justo)
+        self.mtm_fair = 0.0                # posição x variação do preço justo (exposição direcional)
+        self.trade_details = []            # um dict por negócio fechado
 
     def _get_obs(self):
         bid_t = self.bid[self.t]
@@ -481,6 +493,14 @@ class ArbitrageTradingEnv(gym.Env):
         self.trade_pnls.append(net_realized)
         self.trade_durations.append(self.t - self._open_tick)
         self.trade_close_ticks.append(self.t)
+        if self.track_details:
+            o, c = self._open_tick, self.t
+            self.trade_details.append((
+                self.position, o, c, net_realized,
+                self.feature_matrix[o, 0], self.feature_matrix[o, 1],
+                self.feature_matrix[c, 0], self.feature_matrix[c, 1],
+                self.mid[o] - self.fair[o], self.mid[c] - self.fair[c],
+                self.fair[o], self.fair[c]))
         if net_realized > 0:
             self.n_trades_won += 1
         return reward, realized
@@ -521,6 +541,10 @@ class ArbitrageTradingEnv(gym.Env):
             mtm = self.position * (mid_t - mid_prev)
             reward += mtm
             self.gross_mtm += mtm
+            if self.track_details:
+                fair_t, fair_p = self.fair[self.t], self.fair[self.t - 1]
+                self.mtm_fair += self.position * (fair_t - fair_p)
+                self.mtm_spread += self.position * ((mid_t - fair_t) - (mid_prev - fair_p))
 
         # 1.5) stop-loss por posição (regra FIXA, não aprendida -- ver
         #    __init__): se configurado e a perda não-realizada da posição
@@ -885,13 +909,22 @@ def _mp_context():
 
 _EVAL = {}
 
+# offsets (em ticks) do event study: variação do mispricing em relação à
+# ENTRADA, na direção da posição (positivo = spread convergiu a favor)
+EVENT_OFFSETS = (-200, -100, -50, 0, 50, 100, 200, 400, 800)
 
-def _eval_init(spec, mean, std, fee):
+TRADE_COLS = ["direction", "entry_tick", "exit_tick", "pnl",
+              "entry_z_compra", "entry_z_venda", "exit_z_compra", "exit_z_venda",
+              "entry_misp", "exit_misp", "entry_fair", "exit_fair"]
+
+
+def _eval_init(spec, mean, std, fee, latency=0):
     torch.set_num_threads(1)
     _EVAL["spec"] = spec
     _EVAL["mean"] = mean
     _EVAL["std"] = std
     _EVAL["fee"] = fee
+    _EVAL["latency"] = latency
     _EVAL["model"] = PPO.load(spec[1], device="cpu") if spec[0] == "model" else None
 
 
@@ -925,45 +958,87 @@ def _make_policy(spec, model, order):
     raise ValueError(f"policy spec desconhecida: {spec}")
 
 
-def _run_day(order, spec, model, mean, std, fee, record_equity):
+def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
+    """Roda 1 pregão e devolve as estatísticas do dia + colunas por negócio.
+
+    `latency` = nº de ticks entre a decisão do agente e a execução da ordem
+    (0 = executa no mesmo tick, como no treino). Serve de teste de robustez:
+    uma arbitragem real precisa sobreviver a algum atraso de execução."""
+    from collections import deque
+
     df = process_day_cached(order)
     feat = apply_scaler(build_state_features(df), mean, std)
-    env = ArbitrageTradingEnv(df, feat, transaction_fee=fee, record_equity=record_equity)
+    env = ArbitrageTradingEnv(df, feat, transaction_fee=fee, record_equity=record_equity,
+                              track_details=True)
     policy = _make_policy(spec, model, order)
+    pending = deque([0] * latency)
 
     obs, _ = env.reset()
     done = False
     while not done:
-        obs, _, terminated, truncated, _ = env.step(policy(obs))
+        action = policy(obs)
+        if latency:
+            pending.append(action)
+            action = pending.popleft()
+        obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
     n_ticks = max(env.t, 1)
     dt = pd.to_datetime(df['datahora'])
     hours = dt.dt.hour.to_numpy()
-    close_ticks = np.minimum(np.array(env.trade_close_ticks, dtype=int), len(df) - 1)
+    mid = env.mid
+    misp = mid - env.fair
+
+    # --- colunas por negócio ------------------------------------------------
+    if env.trade_details:
+        arr = np.array(env.trade_details, dtype=float)
+    else:
+        arr = np.empty((0, len(TRADE_COLS)))
+    trades = {name: arr[:, k] for k, name in enumerate(TRADE_COLS)}
+    entry = trades["entry_tick"].astype(int)
+    direction = trades["direction"]
+    trades["duration"] = trades["exit_tick"] - trades["entry_tick"]
+    trades["hour_entry"] = hours[entry] if len(entry) else np.empty(0)
+    trades["hour_exit"] = hours[np.minimum(trades["exit_tick"].astype(int), len(df) - 1)] if len(entry) else np.empty(0)
+    # ganho de convergência (pts, na direção da posição) e componente do preço justo
+    trades["d_misp_dir"] = direction * (trades["exit_misp"] - trades["entry_misp"])
+    trades["d_fair_dir"] = direction * (trades["exit_fair"] - trades["entry_fair"])
+    # event study: direction x (misp[entry+off] - misp[entry])
+    offs = np.array(EVENT_OFFSETS)
+    idx = entry[:, None] + offs[None, :]
+    valid = (idx >= 0) & (idx < len(misp))
+    path = np.where(valid, misp[np.clip(idx, 0, len(misp) - 1)] - misp[entry][:, None], np.nan)
+    ev = direction[:, None] * path
+    for j, off in enumerate(EVENT_OFFSETS):
+        trades[f"ev_{off}"] = ev[:, j]
+
     equity = None
     max_dd = float('nan')
     if env.equity is not None:
         eq = np.array(env.equity)
         max_dd = float(np.max(np.maximum.accumulate(eq) - eq)) if len(eq) else 0.0
         equity = eq[::50].tolist()
+    pct_long = env.ticks_long / n_ticks
+    pct_short = env.ticks_short / n_ticks
     return {
         "order": int(order),
         "date": str(dt.iloc[0].date()),
         "pnl": float(env.total_reward),
         "gross_mtm": float(env.gross_mtm),
+        "pnl_spread": float(env.mtm_spread),   # ganho por convergência do mispricing
+        "pnl_fair": float(env.mtm_fair),       # ganho por exposição ao preço justo (direcional)
         "cost": float(env.gross_mtm - env.total_reward),
+        "win_move": float(mid[-1] - mid[0]),   # variação do WIN no dia (pts)
+        "net_exposure": pct_long - pct_short,
         "n_trades": int(env.n_trades_closed),
         "n_wins": int(env.n_trades_won),
-        "pct_long": env.ticks_long / n_ticks,
-        "pct_short": env.ticks_short / n_ticks,
-        "pct_flat": 1.0 - (env.ticks_long + env.ticks_short) / n_ticks,
+        "pct_long": pct_long,
+        "pct_short": pct_short,
+        "pct_flat": 1.0 - pct_long - pct_short,
         "mean_duration": float(np.mean(env.trade_durations)) if env.trade_durations else 0.0,
         "max_drawdown": max_dd,
         "n_ticks": int(n_ticks),
-        "trade_pnls": [float(x) for x in env.trade_pnls],
-        "trade_hours": [int(h) for h in hours[close_ticks]] if len(close_ticks) else [],
-        "trade_durations": [int(x) for x in env.trade_durations],
+        "trades": trades,
         "equity": equity,
     }
 
@@ -971,21 +1046,34 @@ def _run_day(order, spec, model, mean, std, fee, record_equity):
 def _eval_day_worker(args):
     order, record_equity = args
     return _run_day(order, _EVAL["spec"], _EVAL["model"], _EVAL["mean"],
-                    _EVAL["std"], _EVAL["fee"], record_equity)
+                    _EVAL["std"], _EVAL["fee"], record_equity, _EVAL["latency"])
 
 
-def run_policy_on_days(spec, orders, mean, std, fee=2.5, n_workers=None, record_equity=False):
+def run_policy_on_days(spec, orders, mean, std, fee=2.5, n_workers=None,
+                       record_equity=False, latency=0):
     """Roda uma política ('model', path) / ('flat',) / ('random', seed) /
     ('threshold', z) em cada pregão de `orders`, em paralelo. Retorna uma
     lista de dicts (um por dia, na ordem de `orders`)."""
     orders = list(orders)
     n_workers = min(n_workers or _n_pool_workers(), len(orders))
     if n_workers <= 1:
-        _eval_init(spec, mean, std, fee)
+        _eval_init(spec, mean, std, fee, latency)
         return [_eval_day_worker((o, record_equity)) for o in orders]
     with _mp_context().Pool(n_workers, initializer=_eval_init,
-                            initargs=(spec, mean, std, fee)) as pool:
+                            initargs=(spec, mean, std, fee, latency)) as pool:
         return pool.map(_eval_day_worker, [(o, record_equity) for o in orders], chunksize=1)
+
+
+def _all_trades_df(day_results):
+    """DataFrame com TODOS os negócios de todos os dias (colunas por negócio)."""
+    frames = []
+    for d in day_results:
+        t = pd.DataFrame(d["trades"])
+        t.insert(0, "order", d["order"])
+        t.insert(1, "date", d["date"])
+        frames.append(t)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["order", "date"] + TRADE_COLS)
 
 
 def summarize_days(day_results):
@@ -997,6 +1085,17 @@ def summarize_days(day_results):
     sharpe = float(pnl.mean() / daily_std * np.sqrt(252)) if daily_std and daily_std > 0 else float('nan')
     cum = np.cumsum(pnl)
     max_dd_days = float(np.max(np.maximum.accumulate(cum) - cum)) if len(cum) else 0.0
+
+    # --- diagnóstico de arbitragem ------------------------------------------
+    win_move = np.array([d["win_move"] for d in day_results])
+    pnl_gross = np.array([d["gross_mtm"] for d in day_results])
+    corr = beta = float('nan')
+    if len(pnl) > 2 and pnl_gross.std() > 0 and win_move.std() > 0:
+        corr = float(np.corrcoef(pnl_gross, win_move)[0, 1])
+        beta = float(np.polyfit(win_move, pnl_gross, 1)[0])
+    d_misp = np.concatenate([d["trades"]["d_misp_dir"] for d in day_results] or [np.empty(0)])
+    pnl_spread = float(sum(d["pnl_spread"] for d in day_results))
+    pnl_fair = float(sum(d["pnl_fair"] for d in day_results))
     return {
         "n_days": len(day_results),
         "pnl_total": float(pnl.sum()),
@@ -1007,6 +1106,14 @@ def summarize_days(day_results):
         "max_drawdown_daily_cum": max_dd_days,
         "gross_mtm_total": float(sum(d["gross_mtm"] for d in day_results)),
         "cost_total": float(sum(d["cost"] for d in day_results)),
+        "pnl_spread_component": pnl_spread,
+        "pnl_fair_component": pnl_fair,
+        "spread_share_of_gross": pnl_spread / (pnl_spread + pnl_fair) if (pnl_spread + pnl_fair) != 0 else float('nan'),
+        "corr_gross_vs_win_move": corr,
+        "beta_gross_vs_win_move": beta,
+        "mean_net_exposure": float(np.mean([d["net_exposure"] for d in day_results])),
+        "mean_d_misp_per_trade": float(d_misp.mean()) if len(d_misp) else float('nan'),
+        "pct_trades_converged": float((d_misp > 0).mean()) if len(d_misp) else float('nan'),
         "n_trades": n_trades,
         "trades_per_day": n_trades / max(len(day_results), 1),
         "win_rate": n_wins / max(n_trades, 1),
@@ -1014,21 +1121,28 @@ def summarize_days(day_results):
         "pct_short": float(np.mean([d["pct_short"] for d in day_results])),
         "pct_flat": float(np.mean([d["pct_flat"] for d in day_results])),
         "mean_trade_duration_ticks": float(np.mean(
-            [x for d in day_results for x in d["trade_durations"]] or [0.0])),
+            np.concatenate([d["trades"]["duration"] for d in day_results] or [np.zeros(1)]))),
     }
 
 
+def _signal_z(trades):
+    """z do sinal na ENTRADA, orientado: positivo = sinal 'forte' (compra com
+    spread_compra baixo, venda com spread_venda alto)."""
+    return np.where(trades["direction"] > 0, -trades["entry_z_compra"], trades["entry_z_venda"])
+
+
 def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
-                     n_workers=None, verbose=True):
+                     n_workers=None, verbose=True, latency=0):
     """Avalia uma política em `orders`, imprime o resumo e (se `out_dir`)
-    grava `<label>_days.csv`, `<label>_trades.csv` e `<label>_equity.csv`.
-    Retorna o dict de resumo."""
-    days = run_policy_on_days(spec, orders, mean, std, fee=fee,
-                              n_workers=n_workers, record_equity=out_dir is not None)
+    grava CSVs: `<label>_days.csv`, `_trades.csv` (com spreads de entrada/
+    saída e ganho de convergência), `_equity.csv`, `_eventstudy.csv` e
+    `_entry_buckets.csv`. Retorna o dict de resumo."""
+    days = run_policy_on_days(spec, orders, mean, std, fee=fee, n_workers=n_workers,
+                              record_equity=out_dir is not None, latency=latency)
     summ = summarize_days(days)
 
     if verbose:
-        print(f"\n--- {label} (fee={fee}) ---")
+        print(f"\n--- {label} (fee={fee}, latência={latency} ticks) ---")
         print(f"Dias: {summ['n_days']}  |  P/L total: {summ['pnl_total']:.1f} pts "
               f"(R$ {summ['pnl_total_brl']:.2f})  |  média/dia: {summ['pnl_mean_day']:.1f} "
               f"(desvio {summ['pnl_std_day']:.1f})  |  Sharpe diário anualizado: "
@@ -1039,23 +1153,27 @@ def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
         print(f"Tempo comprado/vendido/flat: {summ['pct_long']:.1%} / "
               f"{summ['pct_short']:.1%} / {summ['pct_flat']:.1%}  |  duração média "
               f"do negócio: {summ['mean_trade_duration_ticks']:.0f} ticks")
+        print(f"ARBITRAGEM? P/L bruto = convergência do spread {summ['pnl_spread_component']:.1f} "
+              f"+ direcional (preço justo) {summ['pnl_fair_component']:.1f}  "
+              f"(spread = {summ['spread_share_of_gross']:.0%} do bruto)")
+        print(f"   corr(P/L bruto dia, movimento do WIN) = {summ['corr_gross_vs_win_move']:.2f}  |  "
+              f"exposição líquida média = {summ['mean_net_exposure']:+.1%}  |  "
+              f"negócios em que o spread convergiu: {summ['pct_trades_converged']:.1%} "
+              f"(média {summ['mean_d_misp_per_trade']:+.2f} pts)")
 
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
-        day_cols = ["order", "date", "pnl", "gross_mtm", "cost", "n_trades", "n_wins",
-                    "pct_long", "pct_short", "pct_flat", "mean_duration",
-                    "max_drawdown", "n_ticks"]
+        day_cols = ["order", "date", "pnl", "gross_mtm", "pnl_spread", "pnl_fair", "cost",
+                    "win_move", "net_exposure", "n_trades", "n_wins", "pct_long",
+                    "pct_short", "pct_flat", "mean_duration", "max_drawdown", "n_ticks"]
         pd.DataFrame([{k: d[k] for k in day_cols} for d in days]).to_csv(
             os.path.join(out_dir, f"{label}_days.csv"), index=False)
-        trade_rows = [
-            {"order": d["order"], "date": d["date"], "hour_close": h,
-             "pnl": p, "duration_ticks": du}
-            for d in days
-            for p, h, du in zip(d["trade_pnls"], d["trade_hours"], d["trade_durations"])
-        ]
-        pd.DataFrame(trade_rows, columns=["order", "date", "hour_close", "pnl",
-                                           "duration_ticks"]).to_csv(
-            os.path.join(out_dir, f"{label}_trades.csv"), index=False)
+
+        trades = _all_trades_df(days)
+        if len(trades) > 50_000:  # ex.: baseline aleatório faz ~13k negócios/dia
+            trades = trades.sample(50_000, random_state=0).sort_index()
+        trades.to_csv(os.path.join(out_dir, f"{label}_trades.csv"), index=False)
+
         eq_rows, base = [], 0.0
         for d in days:
             for k, v in enumerate(d["equity"] or []):
@@ -1064,11 +1182,43 @@ def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
         pd.DataFrame(eq_rows, columns=["order", "tick", "equity"]).to_csv(
             os.path.join(out_dir, f"{label}_equity.csv"), index=False)
 
-        # distribuição de P/L por negócio (todos, não só percentis)
-        pnls = np.array([p for d in days for p in d["trade_pnls"]])
-        if len(pnls):
+        full = _all_trades_df(days)
+        if len(full):
+            # event study: variação média do mispricing após a entrada, na
+            # direção da posição, por direção (long/short) e geral
+            rows = []
+            for name, sub in (("all", full), ("long", full[full.direction > 0]),
+                              ("short", full[full.direction < 0])):
+                for off in EVENT_OFFSETS:
+                    v = sub[f"ev_{off}"].dropna()
+                    rows.append({"group": name, "offset_ticks": off,
+                                 "mean_directed_d_misp": v.mean() if len(v) else np.nan,
+                                 "n": len(v)})
+            pd.DataFrame(rows).to_csv(os.path.join(out_dir, f"{label}_eventstudy.csv"), index=False)
+
+            # por força do sinal na entrada: o agente ganha mais quando o
+            # spread está mais extremo? (arbitragem => sim)
+            z = _signal_z(full)
+            bins = [-np.inf, 0.0, 1.0, 2.0, np.inf]
+            names = ["z<0", "0<=z<1", "1<=z<2", "z>=2"]
+            bucket = pd.cut(pd.Series(z), bins=bins, labels=names, right=False)
+            g = full.assign(bucket=bucket.values).groupby("bucket", observed=False).agg(
+                n=("pnl", "size"), pnl_mean=("pnl", "mean"),
+                win_rate=("pnl", lambda x: (x > 0).mean()),
+                d_misp_mean=("d_misp_dir", "mean"), duration_mean=("duration", "mean"))
+            g.to_csv(os.path.join(out_dir, f"{label}_entry_buckets.csv"))
+            if verbose:
+                print("   por força do sinal na entrada (z orientado):")
+                for b, r in g.iterrows():
+                    if r["n"]:
+                        print(f"     {b:>7}: n={int(r['n']):>6}  P/L médio {r['pnl_mean']:+7.2f}  "
+                              f"acerto {r['win_rate']:.0%}  convergência média {r['d_misp_mean']:+6.2f}")
+                ev_all = {off: full[f'ev_{off}'].mean() for off in (50, 200, 800)}
+                print("   event study (Δ mispricing médio pós-entrada, a favor): "
+                      + "  ".join(f"+{o} ticks: {v:+.2f}" for o, v in ev_all.items()))
+            pnls = full["pnl"].to_numpy()
             wins, losses = pnls[pnls > 0], pnls[pnls <= 0]
-            print(f"P/L por negócio: ganho médio {wins.mean() if len(wins) else 0:.2f} | "
+            print(f"   P/L por negócio: ganho médio {wins.mean() if len(wins) else 0:.2f} | "
                   f"perda média {losses.mean() if len(losses) else 0:.2f} | "
                   + " ".join(f"p{q}={np.percentile(pnls, q):.2f}" for q in (1, 5, 50, 95, 99)))
     return summ
@@ -1367,15 +1517,16 @@ def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds
 #    baselines, sensibilidade a custo, curva de checkpoints)
 # --------------------------------------------------------------------------
 
-def run_eval_job(fold, run_dir, fee=2.5, job_hard_seconds=None):
-    import glob
-    import re
+def run_eval_job(fold, run_dir, fee=2.5, job_hard_seconds=None, part=1):
+    """part=1: modelos principais, baselines e sensibilidade a custo.
+    part=2: teste de latência e curva de checkpoints. Divididos em dois
+    jobs porque juntos passam de 20 min."""
     mean, std = load_or_fit_scaler(run_dir, fold["train_orders"], _n_pool_workers())
     out_dir = os.path.join(run_dir, "eval")
     os.makedirs(out_dir, exist_ok=True)
     deadline = (SCRIPT_START + job_hard_seconds) if job_hard_seconds else None
     summary_path = os.path.join(out_dir, "summary.csv")
-    if os.path.exists(summary_path):
+    if part == 1 and os.path.exists(summary_path):
         os.remove(summary_path)
 
     def has_time(needed):
@@ -1393,6 +1544,15 @@ def run_eval_job(fold, run_dir, fee=2.5, job_hard_seconds=None):
         if os.path.exists(path):
             models[name] = path
 
+    ref_name = "best_val" if "best_val" in models else ("last" if "last" in models else None)
+
+    if part == 1:
+        _eval_part1(models, ref_name, sets, mean, std, fee, out_dir, has_time, record)
+    else:
+        _eval_part2(models, ref_name, sets, mean, std, fee, out_dir, has_time, record, run_dir)
+
+
+def _eval_part1(models, ref_name, sets, mean, std, fee, out_dir, has_time, record):
     # 1) modelos principais (fee de treino)
     for mname, mpath in models.items():
         for sname, orders in sets.items():
@@ -1415,7 +1575,6 @@ def run_eval_job(fold, run_dir, fee=2.5, job_hard_seconds=None):
                    evaluate_and_log(label, spec, orders, mean, std, fee=fee, out_dir=out_dir))
 
     # 3) sensibilidade a custo do melhor-de-validação
-    ref_name = "best_val" if "best_val" in models else ("last" if "last" in models else None)
     if ref_name:
         for fee_alt in (0.0, 0.5):
             for sname, orders in sets.items():
@@ -1425,6 +1584,23 @@ def run_eval_job(fold, run_dir, fee=2.5, job_hard_seconds=None):
                 record(label, ref_name, sname, fee_alt,
                        evaluate_and_log(label, ("model", models[ref_name]), orders, mean, std,
                                         fee=fee_alt, out_dir=out_dir))
+
+
+
+def _eval_part2(models, ref_name, sets, mean, std, fee, out_dir, has_time, record, run_dir):
+    import glob
+    import re
+    # 3.5) teste de latência: a decisão só é executada `k` ticks depois (uma
+    # arbitragem real precisa sobreviver a algum atraso de execução)
+    if ref_name:
+        for lat in (1, 5, 20):
+            for sname, orders in sets.items():
+                if not has_time(120):
+                    continue
+                label = f"latency{lat}_{sname}_fee{fee}"
+                record(label, ref_name, sname, fee,
+                       evaluate_and_log(label, ("model", models[ref_name]), orders, mean, std,
+                                        fee=fee, out_dir=out_dir, latency=lat))
 
     # 4) curva de checkpoints em val e teste (SÓ para relatório, não seleciona nada)
     curve_path = os.path.join(out_dir, "checkpoint_curve.csv")
@@ -1493,8 +1669,9 @@ if __name__ == "__main__":
         print(f"\n########## FOLD {f['fold']}/{len(folds)} (RUN_TAG={run_tag}) ##########")
         run_dir = fold_run_dir(run_tag, f["fold"])
 
-        if os.environ.get("RUN_EVAL") == "1":
-            run_eval_job(f, run_dir, fee=fee, job_hard_seconds=job_hard)
+        if os.environ.get("RUN_EVAL") in ("1", "2"):
+            run_eval_job(f, run_dir, fee=fee, job_hard_seconds=job_hard,
+                         part=int(os.environ["RUN_EVAL"]))
             continue
 
         state = train_chunk(
@@ -1507,4 +1684,5 @@ if __name__ == "__main__":
         )
         # execução local (sem limite de job): avalia direto ao terminar
         if state["done"] and job_hard is None:
-            run_eval_job(f, run_dir, fee=fee)
+            run_eval_job(f, run_dir, fee=fee, part=1)
+            run_eval_job(f, run_dir, fee=fee, part=2)

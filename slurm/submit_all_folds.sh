@@ -6,9 +6,10 @@
 # Para CADA fold:
 #   1) encadeia jobs de TREINO (chunks de ~20 min, checkpoint + resume) até
 #      o state.json do fold marcar "done": true (total_timesteps atingido);
-#   2) submete 1 job só de AVALIAÇÃO (RUN_EVAL=1): melhor-de-validação e
-#      último modelo em val/teste, baselines, sensibilidade a custo e curva
-#      de checkpoints -- tudo em CSV em src/runs/<RUN_TAG>/fold<N>/eval/.
+#   2) submete 2 jobs só de AVALIAÇÃO (RUN_EVAL=1 e 2): melhor-de-validação e
+#      último modelo em val/teste, baselines, sensibilidade a custo, teste
+#      de latência, diagnóstico de arbitragem e curva de checkpoints -- tudo
+#      em CSV em src/runs/<RUN_TAG>/fold<N>/eval/.
 #
 # O número de chunks NÃO é fixo: o pipeline treina até total_timesteps (ver
 # TOTAL_TIMESTEPS) e o fim é decidido pelo state.json. O plano estimado
@@ -97,12 +98,17 @@ for i in $FOLDS; do
         echo "AVISO: fold $i não atingiu TOTAL_TIMESTEPS em $max_chunks chunks -- avaliando o que existe."
     fi
 
-    wait_for_empty_queue
-    echo "=== Fold $i: job de avaliação ($(date)) ==="
-    sbatch --wait \
-        --job-name="pairs-rl-fold${i}-${RUN_TAG}-eval" \
-        --export=ALL,SLURM_ARRAY_TASK_ID="$i",RESUME_TRAINING=1,CHUNK_INDEX=0,RUN_EVAL=1 \
-        slurm/submit_fold.sbatch || echo "AVISO: job de avaliação do fold $i terminou com erro/timeout"
+    # avaliação em 2 jobs (juntos passam de 20 min):
+    #   parte 1 = modelos principais + baselines + sensibilidade a custo
+    #   parte 2 = teste de latência + curva de checkpoints
+    for part in 1 2; do
+        wait_for_empty_queue
+        echo "=== Fold $i: job de avaliação parte $part ($(date)) ==="
+        sbatch --wait \
+            --job-name="pairs-rl-fold${i}-${RUN_TAG}-eval${part}" \
+            --export=ALL,SLURM_ARRAY_TASK_ID="$i",RESUME_TRAINING=1,CHUNK_INDEX=0,RUN_EVAL="$part" \
+            slurm/submit_fold.sbatch || echo "AVISO: avaliação (parte $part) do fold $i terminou com erro/timeout"
+    done
     echo "=== Fold $i concluído ($(date)) ==="
 done
 
