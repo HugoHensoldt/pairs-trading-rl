@@ -17,12 +17,13 @@
 set -uo pipefail
 
 SEEDS="${SEEDS:-0 1 2}"
+TAG_PREFIX="${TAG_PREFIX:-v4_s}"   # RUN_TAG = ${TAG_PREFIX}<seed> (ex.: hedge_s -> hedge_s0)
 cd "$(dirname "$0")/.."
 
 falhas=""
 for seed in $SEEDS; do
-    echo "########## SEED $seed (RUN_TAG=v4_s${seed}) — $(date) ##########"
-    if RUN_TAG="v4_s${seed}" SEED="$seed" bash slurm/submit_all_folds.sh; then
+    echo "########## SEED $seed (RUN_TAG=${TAG_PREFIX}${seed}) — $(date) ##########"
+    if RUN_TAG="${TAG_PREFIX}${seed}" SEED="$seed" bash slurm/submit_all_folds.sh; then
         echo "########## SEED $seed concluída — $(date) ##########"
     else
         echo "########## SEED $seed FALHOU — $(date) ##########" >&2

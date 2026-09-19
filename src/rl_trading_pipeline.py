@@ -24,7 +24,12 @@ Estrutura:
      aqui porque rl_exit_only.py importa deles)
   3) fit_feature_scaler()   -> normaliza usando estatística SOMENTE do
                                 treino (salvo em runs/<tag>/fold<N>/scaler.npz)
-  4) ArbitrageTradingEnv    -> ambiente Gymnasium: 1 episódio = 1 pregão
+  4) ArbitrageTradingEnv    -> ambiente Gymnasium só-WIN (ENV_KIND=win_only):
+                                1 episódio = 1 pregão
+     HedgedPairEnv          -> ambiente com HEDGE (padrão, ENV_KIND=hedged):
+                                1 WIN + N_BOVA = P_WIN/(5*P_BOVA) ações de
+                                BOVA11 em sentido oposto; recompensa = P/L
+                                do par em R$ menos custos (ver a classe)
   5) MultiDayEnv            -> alterna entre vários pregões pré-carregados
   6) generate_fixed_window_folds() -> folds de janela expansiva com
                                 tamanhos de treino fixos (100/150/200)
@@ -184,19 +189,20 @@ _DAY_MEMO = {}
 
 def process_day_cached(order, Periodo=3000):
     """process_day() com cache em .npz das colunas usadas na v4 (bid, ask,
-    Wbjusto, Wajusto, datahora). Ler/parsear os JSONs UTF-16 e calcular as
+    Wbjusto, Wajusto, bbid, bask, datahora). Ler/parsear os JSONs UTF-16 e calcular as
     médias móveis é o que dominava o startup de cada chunk (cada um dos ~48
     processos do SubprocVecEnv carrega TODOS os dias de treino); com o
     cache o startup vira leitura de arrays. O arquivo é gravado de forma
     atômica (tmp + replace) porque vários processos podem preencher o mesmo
     dia ao mesmo tempo."""
-    cols = ('bid', 'ask', 'Wbjusto', 'Wajusto')
+    cols = ('bid', 'ask', 'Wbjusto', 'Wajusto', 'bbid', 'bask')
     # memo em memória: com DummyVecEnv, dezenas de envs no MESMO processo
     # pedem os mesmos dias -- carrega cada um uma vez só (o df não é
     # modificado por ninguém, só lido)
     if (order, Periodo) in _DAY_MEMO:
         return _DAY_MEMO[(order, Periodo)]
-    path = os.path.join(_day_cache_dir(), f"day{order}_p{Periodo}.npz")
+    # _v2: inclui as cotações do BOVA11 (bbid/bask), usadas pelo env hedgeado
+    path = os.path.join(_day_cache_dir(), f"day{order}_p{Periodo}_v2.npz")
     if os.path.exists(path):
         try:
             z = np.load(path)
@@ -370,6 +376,8 @@ class ArbitrageTradingEnv(gym.Env):
     """
 
     metadata = {"render_modes": []}
+    UNIT_BRL = POINT_VALUE_BRL   # P/L e recompensa em PONTOS do WIN (x0,20 = R$)
+    UNIT_LABEL = "pts"
 
     def __init__(self, df, feature_matrix, transaction_fee=2.5,
                  reward_scale=1.0, max_loss_per_position=None,
@@ -599,6 +607,252 @@ class ArbitrageTradingEnv(gym.Env):
 
 
 # --------------------------------------------------------------------------
+# 3.5) AMBIENTE COM HEDGE (WIN + BOVA11) -- recompensa = P/L financeiro do PAR
+# --------------------------------------------------------------------------
+
+HEDGE_FACTOR = 5.0                    # N_BOVA = P_WIN / (5 * P_BOVA); 5 = 1 / (R$0,20 por ponto)
+WIN_COST_PER_SIDE_BRL = 0.25          # R$ 0,50 ida e volta por contrato de WIN
+BOVA_COST_PCT_PER_SIDE = 0.000230     # 0,0230% por lado sobre o valor financeiro da perna BOVA11
+
+
+class HedgedPairEnv(gym.Env):
+    """Ambiente de RL para um pregão com posição SEMPRE hedgeada.
+
+    Ação (Discrete(3)): posição-ALVO do par, q em {-1, 0, +1}
+        0 = flat
+        1 = q=+1: comprado em 1 WIN e VENDIDO em BOVA11
+        2 = q=-1: vendido em 1 WIN e COMPRADO em BOVA11
+    As duas pernas têm sempre sentido oposto; nunca há posição direcional
+    em um ativo só.
+
+    Hedge: 1 contrato de WIN e N_BOVA = P_WIN / (5 * P_BOVA) ações de BOVA11,
+    calculado na ABERTURA (preços mid) e mantido FIXO até o fechamento.
+
+    P/L (mark-to-market, em R$; preços mid de WIN e BOVA11):
+        q=+1: P&L_WIN = 0,20 * (P_WIN(t) - P_WIN(t-1))
+              P&L_BOVA = N_BOVA * (P_BOVA(t-1) - P_BOVA(t))
+        q=-1: P&L_WIN = 0,20 * (P_WIN(t-1) - P_WIN(t))
+              P&L_BOVA = N_BOVA * (P_BOVA(t) - P_BOVA(t-1))
+    O fator 0,20 R$/ponto (POINT_VALUE_BRL) converte o P/L do WIN de pontos
+    para R$, a mesma unidade da perna BOVA11 e dos custos -- sem isso as
+    pernas não se anulariam (o "5" do hedge é exatamente 1/0,20).
+
+    Custos (só ao ABRIR ou FECHAR; posição mantida = sem custo):
+        C = 0,25 + 0,000230 * V_BOVA     (R$; V_BOVA = N_BOVA * P_BOVA no tick)
+    Trocar de sentido (q=+1 -> q=-1) = fechar + abrir (dois custos).
+    Recompensa R(t) = P&L_WIN + P&L_BOVA - C  (em R$, multiplicada por
+    `reward_scale` só para o PPO; o P/L reportado em `total_reward` etc. é
+    sempre em R$). Por padrão NÃO há custo de cruzar o book (bid/ask), pois
+    a especificação lista só as taxas; `include_spread_cost=True` (ou
+    HEDGE_SPREAD_COST=1) soma meio-spread de WIN e BOVA em cada lado, como
+    sensibilidade de custo mais realista.
+
+    Observação (4 dimensões, igual ao ArbitrageTradingEnv): [spread_compra,
+    spread_venda (z-score), posição, P/L não realizado do par desde a
+    abertura dividido pelo custo nominal de ida e volta da operação].
+
+    `transaction_fee` aqui é um MULTIPLICADOR dos custos (1.0 = custos da
+    especificação; 0.0 = sem custo), o nome só mantém a mesma assinatura do
+    ArbitrageTradingEnv.
+    """
+
+    metadata = {"render_modes": []}
+    UNIT_BRL = 1.0        # P/L e recompensa já estão em R$
+    UNIT_LABEL = "R$"
+
+    def __init__(self, df, feature_matrix, transaction_fee=1.0, reward_scale=None,
+                 max_loss_per_position=None, record_equity=False, track_details=False,
+                 include_spread_cost=None):
+        super().__init__()
+        assert len(df) == len(feature_matrix)
+        self.n_day_ticks = len(df)
+        self.record_equity = record_equity
+        self.track_details = track_details
+        self.cost_scale = float(transaction_fee)
+        self.reward_scale = (float(os.environ.get("HEDGE_REWARD_SCALE", "5.0"))
+                             if reward_scale is None else float(reward_scale))
+        self.include_spread_cost = ((os.environ.get("HEDGE_SPREAD_COST", "0") == "1")
+                                    if include_spread_cost is None else include_spread_cost)
+        # arrays numpy (sem guardar o DataFrame; ver ArbitrageTradingEnv)
+        self.win_bid = df['bid'].to_numpy(dtype=float)
+        self.win_ask = df['ask'].to_numpy(dtype=float)
+        self.bova_bid = df['bbid'].to_numpy(dtype=float)
+        self.bova_ask = df['bask'].to_numpy(dtype=float)
+        # mids calculados sob demanda (_wm/_bm): com dezenas de envs x centenas
+        # de dias por processo, arrays de mid extras custariam GBs
+        self.feature_matrix = feature_matrix.astype(np.float32)
+        self.n_features = feature_matrix.shape[1]
+        if self.track_details:
+            self.mid = (self.win_bid + self.win_ask) / 2
+            self.fair = ((df['Wajusto'] + df['Wbjusto']) / 2).to_numpy(dtype=float)
+
+        obs_dim = self.n_features + 1 + 1      # features + posição + P/L
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
+                                             shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Discrete(3)
+        self._reset_state()
+
+    def _reset_state(self):
+        self.t = 0
+        self.position = 0                  # -1, 0, +1
+        self.n_bova = 0.0                  # ações de BOVA11 da posição aberta (fixo)
+        self.open_value = 0.0              # V_BOVA na abertura (custo nominal do par)
+        self.trade_gross = 0.0             # MtM do par desde a abertura (sem custos)
+        self.trade_open_cost = 0.0
+        self.n_trades_closed = 0
+        self.n_trades_won = 0
+        self.trade_pnls = []               # P/L líquido (R$) de cada negócio fechado
+        # --- contadores para o relatório ---------------------------------
+        self.ticks_long = 0
+        self.ticks_short = 0
+        self.gross_mtm = 0.0               # MtM do par (WIN + BOVA), antes dos custos
+        self.mtm_win_leg = 0.0
+        self.mtm_bova_leg = 0.0
+        # por construção não há componente direcional; os nomes abaixo mantêm
+        # compatibilidade com a decomposição do ArbitrageTradingEnv
+        self.mtm_spread = 0.0              # = MtM do par (o "ganho de convergência")
+        self.mtm_fair = 0.0
+        self.total_reward = 0.0            # líquido de custos, em R$
+        self.trade_durations = []
+        self.trade_close_ticks = []
+        self._open_tick = 0
+        self.equity = [] if self.record_equity else None
+        self.trade_details = []
+
+    def _wm(self, t):
+        return 0.5 * (self.win_bid[t] + self.win_ask[t])
+
+    def _bm(self, t):
+        return 0.5 * (self.bova_bid[t] + self.bova_ask[t])
+
+    # ---------------------------------------------------------------- custos
+    def _txn_cost(self, t, v_bova):
+        c = (WIN_COST_PER_SIDE_BRL + BOVA_COST_PCT_PER_SIDE * v_bova) * self.cost_scale
+        if self.include_spread_cost:
+            c += (0.5 * (self.win_ask[t] - self.win_bid[t]) * POINT_VALUE_BRL
+                  + 0.5 * (self.bova_ask[t] - self.bova_bid[t]) * self.n_bova)
+        return c
+
+    def _get_obs(self):
+        if self.position != 0:
+            rt_cost = 2.0 * (WIN_COST_PER_SIDE_BRL + BOVA_COST_PCT_PER_SIDE * self.open_value)
+            unrealized_norm = self.trade_gross / max(rt_cost, 1e-6)
+        else:
+            unrealized_norm = 0.0
+        obs = np.empty(self.n_features + 2, dtype=np.float32)
+        obs[:self.n_features] = self.feature_matrix[self.t]
+        obs[self.n_features] = self.position
+        obs[self.n_features + 1] = unrealized_norm
+        return obs
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._reset_state()
+        return self._get_obs(), {}
+
+    def _close_pair(self, t):
+        """Fecha o par no tick t; devolve o custo (>= 0) pago no fechamento."""
+        v_close = self.n_bova * self._bm(t)
+        cost = self._txn_cost(t, v_close)
+        net = self.trade_gross - self.trade_open_cost - cost
+        self.n_trades_closed += 1
+        self.trade_pnls.append(net)
+        if net > 0:
+            self.n_trades_won += 1
+        self.trade_durations.append(t - self._open_tick)
+        self.trade_close_ticks.append(t)
+        if self.track_details:
+            o = self._open_tick
+            self.trade_details.append((
+                self.position, o, t, net,
+                self.feature_matrix[o, 0], self.feature_matrix[o, 1],
+                self.feature_matrix[t, 0], self.feature_matrix[t, 1],
+                self._wm(o) - self.fair[o], self._wm(t) - self.fair[t],
+                self.fair[o], self.fair[t]))
+        self.position = 0
+        self.n_bova = 0.0
+        self.open_value = 0.0
+        self.trade_gross = 0.0
+        self.trade_open_cost = 0.0
+        return cost
+
+    def _open_pair(self, target, t):
+        """Abre o par no tick t com N_BOVA fixo; devolve o custo pago."""
+        self.n_bova = self._wm(t) / (HEDGE_FACTOR * self._bm(t))
+        self.open_value = self.n_bova * self._bm(t)
+        cost = self._txn_cost(t, self.open_value)
+        self.position = target
+        self.trade_gross = 0.0
+        self.trade_open_cost = cost
+        self._open_tick = t
+        return cost
+
+    def step(self, action):
+        target = {0: 0, 1: 1, 2: -1}[int(action)]
+        t = self.t
+        reward = 0.0
+
+        # 1) MtM do par já aberto ANTES desta ação, do tick anterior até agora
+        if t > 0 and self.position != 0:
+            pnl_win = self.position * (self._wm(t) - self._wm(t - 1)) * POINT_VALUE_BRL
+            pnl_bova = -self.position * self.n_bova * (self._bm(t) - self._bm(t - 1))
+            mtm = pnl_win + pnl_bova
+            reward += mtm
+            self.gross_mtm += mtm
+            self.mtm_win_leg += pnl_win
+            self.mtm_bova_leg += pnl_bova
+            self.mtm_spread += mtm
+            self.trade_gross += mtm
+
+        # 2) troca de posição: fecha o par atual (se houver) e abre o novo
+        if target != self.position:
+            if self.position != 0:
+                reward -= self._close_pair(t)
+            if target != 0:
+                reward -= self._open_pair(target, t)
+
+        if self.position == 1:
+            self.ticks_long += 1
+        elif self.position == -1:
+            self.ticks_short += 1
+
+        self.t += 1
+        terminated = self.t >= self.n_day_ticks - 1
+        truncated = False
+
+        # 3) fim do pregão: força o fechamento do par
+        if terminated and self.position != 0:
+            reward -= self._close_pair(self.t)
+
+        self.total_reward += reward
+        if self.equity is not None:
+            self.equity.append(self.total_reward)
+
+        obs = self._get_obs() if not terminated else np.zeros(
+            self.observation_space.shape, dtype=np.float32)
+        info = {"n_trades_closed": self.n_trades_closed,
+                "n_trades_won": self.n_trades_won,
+                "n_stop_loss_triggers": 0}
+        return obs, reward * self.reward_scale, terminated, truncated, info
+
+
+ENV_KIND = os.environ.get("ENV_KIND", "hedged")   # "hedged" (padrão) | "win_only"
+
+
+def _env_class():
+    """Classe de ambiente usada no treino/avaliação (env var ENV_KIND):
+    'hedged' = HedgedPairEnv (WIN + BOVA11, recompensa do par hedgeado);
+    'win_only' = ArbitrageTradingEnv (só WIN, versões v1-v4 anteriores)."""
+    return HedgedPairEnv if os.environ.get("ENV_KIND", "hedged") == "hedged" else ArbitrageTradingEnv
+
+
+def default_cost_param():
+    """Valor padrão de `transaction_fee` conforme o env: multiplicador de
+    custos (1.0) no hedgeado, taxa em pontos (2.5) no win_only."""
+    return 1.0 if os.environ.get("ENV_KIND", "hedged") == "hedged" else 2.5
+
+
+# --------------------------------------------------------------------------
 # 4) AMBIENTE MULTI-DIA -- alterna entre pregões pré-carregados a cada reset
 # --------------------------------------------------------------------------
 
@@ -643,7 +897,7 @@ def build_day_envs(orders, mean, std, transaction_fee=2.5,
         df = process_day_cached(order)
         feat = build_state_features(df)
         feat = apply_scaler(feat, mean, std)
-        envs.append(ArbitrageTradingEnv(df, feat,
+        envs.append(_env_class()(df, feat,
                                          transaction_fee=transaction_fee,
                                          max_loss_per_position=max_loss_per_position))
     return envs
@@ -978,8 +1232,8 @@ def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
 
     df = process_day_cached(order)
     feat = apply_scaler(build_state_features(df), mean, std)
-    env = ArbitrageTradingEnv(df, feat, transaction_fee=fee, record_equity=record_equity,
-                              track_details=True)
+    env = _env_class()(df, feat, transaction_fee=fee, record_equity=record_equity,
+                       track_details=True)
     policy = _make_policy(spec, model, order)
     pending = deque([0] * latency)
 
@@ -1040,6 +1294,12 @@ def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
         "gross_mtm": float(env.gross_mtm),
         "pnl_spread": float(env.mtm_spread),   # ganho por convergência do mispricing
         "pnl_fair": float(env.mtm_fair),       # ganho por exposição ao preço justo (direcional)
+        # unidade do P/L deste env: pontos do WIN (win_only) ou R$ (hedged)
+        "unit_brl": float(env.UNIT_BRL),
+        "unit_label": env.UNIT_LABEL,
+        # pernas do par hedgeado (R$); 0 no env só-WIN
+        "pnl_win_leg": float(getattr(env, "mtm_win_leg", 0.0)),
+        "pnl_bova_leg": float(getattr(env, "mtm_bova_leg", 0.0)),
         "cost": float(env.gross_mtm - env.total_reward),
         "win_move": float(mid[-1] - mid[0]),   # variação do WIN no dia (pts)
         "net_exposure": pct_long - pct_short,
@@ -1112,7 +1372,10 @@ def summarize_days(day_results):
     return {
         "n_days": len(day_results),
         "pnl_total": float(pnl.sum()),
-        "pnl_total_brl": float(pnl.sum() * POINT_VALUE_BRL),
+        "unit": day_results[0]["unit_label"],
+        "pnl_total_brl": float(pnl.sum() * day_results[0]["unit_brl"]),
+        "pnl_win_leg_total": float(sum(d["pnl_win_leg"] for d in day_results)),
+        "pnl_bova_leg_total": float(sum(d["pnl_bova_leg"] for d in day_results)),
         "pnl_mean_day": float(pnl.mean()),
         "pnl_std_day": daily_std,
         "sharpe_daily_annualized": sharpe,
@@ -1156,7 +1419,8 @@ def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
 
     if verbose:
         print(f"\n--- {label} (fee={fee}, latência={latency} ticks) ---")
-        print(f"Dias: {summ['n_days']}  |  P/L total: {summ['pnl_total']:.1f} pts "
+        u = summ["unit"]
+        print(f"Dias: {summ['n_days']}  |  P/L total: {summ['pnl_total']:.1f} {u} "
               f"(R$ {summ['pnl_total_brl']:.2f})  |  média/dia: {summ['pnl_mean_day']:.1f} "
               f"(desvio {summ['pnl_std_day']:.1f})  |  Sharpe diário anualizado: "
               f"{summ['sharpe_daily_annualized']:.2f}")
@@ -1166,9 +1430,14 @@ def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
         print(f"Tempo comprado/vendido/flat: {summ['pct_long']:.1%} / "
               f"{summ['pct_short']:.1%} / {summ['pct_flat']:.1%}  |  duração média "
               f"do negócio: {summ['mean_trade_duration_ticks']:.0f} ticks")
-        print(f"ARBITRAGEM? P/L bruto = convergência do spread {summ['pnl_spread_component']:.1f} "
-              f"+ direcional (preço justo) {summ['pnl_fair_component']:.1f}  "
-              f"(spread = {summ['spread_share_of_gross']:.0%} do bruto)")
+        if u == "R$":
+            print(f"PAR HEDGEADO: perna WIN {summ['pnl_win_leg_total']:.1f} + perna BOVA11 "
+                  f"{summ['pnl_bova_leg_total']:.1f} = bruto do par {summ['gross_mtm_total']:.1f}  "
+                  f"|  custos {summ['cost_total']:.1f}  |  líquido {summ['pnl_total']:.1f} R$")
+        else:
+            print(f"ARBITRAGEM? P/L bruto = convergência do spread {summ['pnl_spread_component']:.1f} "
+                  f"+ direcional (preço justo) {summ['pnl_fair_component']:.1f}  "
+                  f"(spread = {summ['spread_share_of_gross']:.0%} do bruto)")
         print(f"   corr(P/L bruto dia, movimento do WIN) = {summ['corr_gross_vs_win_move']:.2f}  |  "
               f"exposição líquida média = {summ['mean_net_exposure']:+.1%}  |  "
               f"negócios em que o spread convergiu: {summ['pct_trades_converged']:.1%} "
@@ -1176,7 +1445,8 @@ def evaluate_and_log(label, spec, orders, mean, std, fee=2.5, out_dir=None,
 
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
-        day_cols = ["order", "date", "pnl", "gross_mtm", "pnl_spread", "pnl_fair", "cost",
+        day_cols = ["order", "date", "pnl", "gross_mtm", "pnl_spread", "pnl_fair",
+                    "pnl_win_leg", "pnl_bova_leg", "cost",
                     "win_move", "net_exposure", "n_trades", "n_wins", "pct_long",
                     "pct_short", "pct_flat", "mean_duration", "max_drawdown", "n_ticks"]
         pd.DataFrame([{k: d[k] for k in day_cols} for d in days]).to_csv(
@@ -1392,7 +1662,7 @@ class ValidationCallback(BaseCallback):
         path = os.path.join(self.run_dir, "val_curve.csv")
         pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
         if self.verbose:
-            print(f"[Validação @ {self.num_timesteps:,}] P/L val {val['pnl_total']:.1f} pts "
+            print(f"[Validação @ {self.num_timesteps:,}] P/L val {val['pnl_total']:.1f} {val['unit']} "
                   f"({val['trades_per_day']:.1f} negócios/dia) | treino(sub) "
                   f"{trn['pnl_mean_day']:.1f}/dia | {row['eval_seconds']:.0f}s")
 
@@ -1449,6 +1719,9 @@ def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds
     if not resume:
         write_state(run_dir, _new_state())
         write_metadata(run_dir, fold, hparams, {"seed": seed, "transaction_fee": transaction_fee,
+                                                 "env_kind": os.environ.get("ENV_KIND", "hedged"),
+                                                 "hedge_reward_scale": os.environ.get("HEDGE_REWARD_SCALE", "5.0"),
+                                                 "hedge_spread_cost": os.environ.get("HEDGE_SPREAD_COST", "0"),
                                                  "n_train_envs": n_train_envs,
                                                  "vec_env": os.environ.get("VEC_ENV", "dummy"),
                                                  "torch_threads": torch.get_num_threads()})
@@ -1587,7 +1860,26 @@ def _eval_part1(models, ref_name, sets, mean, std, fee, out_dir, has_time, recor
             record(label, f"baseline_{bname}", sname, fee,
                    evaluate_and_log(label, spec, orders, mean, std, fee=fee, out_dir=out_dir))
 
-    # 3) sensibilidade a custo do melhor-de-validação
+    # 3) sensibilidade a custo do melhor-de-validação (no env hedgeado, `fee`
+    # é um multiplicador dos custos da especificação)
+    if ref_name and os.environ.get("ENV_KIND", "hedged") == "hedged":
+        # custo REALISTA: soma meio-spread bid/ask de WIN e BOVA11 em cada
+        # lado (a especificação de recompensa só tem as taxas)
+        old = os.environ.get("HEDGE_SPREAD_COST")
+        os.environ["HEDGE_SPREAD_COST"] = "1"
+        try:
+            for sname, orders in sets.items():
+                if not has_time(120):
+                    continue
+                label = f"spreadcost_{sname}_fee{fee}"
+                record(label, ref_name, sname, fee,
+                       evaluate_and_log(label, ("model", models[ref_name]), orders, mean, std,
+                                        fee=fee, out_dir=out_dir))
+        finally:
+            if old is None:
+                os.environ.pop("HEDGE_SPREAD_COST", None)
+            else:
+                os.environ["HEDGE_SPREAD_COST"] = old
     if ref_name:
         for fee_alt in (0.0, 0.5):
             for sname, orders in sets.items():
@@ -1649,7 +1941,9 @@ if __name__ == "__main__":
 
     run_tag = os.environ.get("RUN_TAG", "v4")
     seed = int(os.environ.get("SEED", "0"))
-    fee = float(os.environ.get("TRANSACTION_FEE", "2.5"))
+    # env hedgeado: multiplicador dos custos da especificação (1.0); env só-WIN:
+    # taxa em pontos (2.5). Ver default_cost_param().
+    fee = float(os.environ.get("TRANSACTION_FEE", str(default_cost_param())))
     train_sizes = tuple(int(x) for x in os.environ.get("TRAIN_SIZES", "100,150,200").split(","))
 
     folds = generate_fixed_window_folds(

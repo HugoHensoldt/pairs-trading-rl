@@ -27,7 +27,8 @@
 # src/rl_trading_pipeline.py.
 set -euo pipefail
 
-N_FOLDS=3  # tamanhos de treino em TRAIN_SIZES (default 100,150,200) -- 1 fold cada
+# 1 fold por tamanho em TRAIN_SIZES (default 100,150,200; ex.: TRAIN_SIZES=300 -> 1 fold)
+N_FOLDS=$(echo "${TRAIN_SIZES:-100,150,200}" | awk -F, '{print NF}')
 
 export RUN_TAG="${RUN_TAG:-v4}"
 FOLDS="${FOLDS:-$(seq 1 "$N_FOLDS")}"
