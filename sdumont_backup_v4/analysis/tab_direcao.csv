@@ -1,0 +1,5 @@
+Run,Conjunto,Dias com posição ≥90% do pregão numa direção,Direção correta,Taxa,"p-valor (binomial, 50%)"
+v4 (50M),validação,10,2,20.0,0.109375
+v4 (50M),teste,16,4,25.0,0.076812744140625
+v4-long (100M),validação,15,8,53.333333333333336,1.0
+v4-long (100M),teste,20,10,50.0,1.0
