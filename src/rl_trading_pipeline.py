@@ -813,10 +813,10 @@ def generate_walk_forward_folds(
 def generate_fixed_window_folds(
     all_orders,
     train_sizes=(100, 150, 200),
-    n_val=15,
-    n_test=15,
+    n_val=30,
+    n_test=30,
     total_timesteps=30_000_000,
-    throughput_steps_per_sec=5500.0,
+    throughput_steps_per_sec=27000.0,
     chunk_seconds=1050.0,
     avg_ticks_per_day=None,
     verbose=True,
@@ -958,12 +958,22 @@ def _make_policy(spec, model, order):
     raise ValueError(f"policy spec desconhecida: {spec}")
 
 
+_ACTION_TO_POS = {0: 0, 1: 1, 2: -1}   # ação (alvo) -> posição
+
+
 def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
     """Roda 1 pregão e devolve as estatísticas do dia + colunas por negócio.
 
     `latency` = nº de ticks entre a decisão do agente e a execução da ordem
     (0 = executa no mesmo tick, como no treino). Serve de teste de robustez:
-    uma arbitragem real precisa sobreviver a algum atraso de execução."""
+    uma arbitragem real precisa sobreviver a algum atraso de execução.
+
+    Com latência, o agente enxerga a posição PRETENDIDA (a do alvo da última
+    ordem decidida, incluindo as ainda em voo) no lugar da posição já
+    executada. Sem isso ele reavalia a mesma situação com a posição
+    defasada e reenvia/cancela ordens a cada tick, pagando spread + taxa
+    (um trader real conhece as próprias ordens pendentes). O P/L não
+    realizado da observação continua o da posição efetivamente aberta."""
     from collections import deque
 
     df = process_day_cached(order)
@@ -976,6 +986,9 @@ def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
     obs, _ = env.reset()
     done = False
     while not done:
+        if latency:
+            obs = obs.copy()
+            obs[2] = _ACTION_TO_POS[pending[-1]]
         action = policy(obs)
         if latency:
             pending.append(action)
@@ -1642,10 +1655,10 @@ if __name__ == "__main__":
     folds = generate_fixed_window_folds(
         all_orders,
         train_sizes=train_sizes,
-        n_val=int(os.environ.get("N_VAL", "15")),
-        n_test=int(os.environ.get("N_TEST", "15")),
+        n_val=int(os.environ.get("N_VAL", "30")),
+        n_test=int(os.environ.get("N_TEST", "30")),
         total_timesteps=int(float(os.environ.get("TOTAL_TIMESTEPS", "30000000"))),
-        throughput_steps_per_sec=float(os.environ.get("THROUGHPUT_STEPS_PER_SEC", "5500")),
+        throughput_steps_per_sec=float(os.environ.get("THROUGHPUT_STEPS_PER_SEC", "27000")),
         chunk_seconds=float(os.environ.get("CHUNK_SECONDS", "1050")),
     )
 
