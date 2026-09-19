@@ -20,7 +20,7 @@ import sys
 import pandas as pd
 
 METRICS = [
-    "pnl_total", "trades_per_day", "win_rate", "gross_mtm_total", "cost_total",
+    "pnl_total", "real_pnl_hedged_brl", "trades_per_day", "win_rate", "gross_mtm_total", "cost_total",
     "pnl_spread_component", "pnl_fair_component", "corr_gross_vs_win_move",
     "mean_net_exposure",
 ]
