@@ -265,10 +265,31 @@ Cada execução `hedged` levou 85–89 min de relógio (4 chunks de treino + 2 j
 
 ---
 
+## 11. Follow-up: as features causais conseguem escolher entradas lucrativas? (custo realista)
+
+Teste feito depois da campanha, sem RL: `src/learnability_rich.py`. Para cada horizonte fixo h (50, 200 e 600 ticks) um regressor (gradient boosting) prevê o P/L líquido de entrar no par em t e sair em t+h, com a contabilidade **ask/bid nas duas pernas** (idêntica ao `HedgedPairEnv` com `HEDGE_SPREAD_COST=1`; conferida por autoteste). Treino: pregões 1–150 (todos os ticks com |spread| ≥ 0,4× o custo, mais 1/10 dos demais, com pesos); o limiar de entrada é escolhido na validação (362–391) e a estratégia sequencial (entra, fica h ticks, não reentra) é medida no teste (392–421). Três conjuntos de features causais: `base` (equivalente ao estado do agente), `rich` (+ dinâmica do spread em 1–500 ticks, estatísticas móveis, "quem moveu", tempo em episódio extremo, idade e atividade das cotações) e `rich_noage` (sem idade/atividade das cotações).
+
+| Horizonte | Features | Negócios/dia (teste) | P/L médio por negócio (R$) | Acerto | P/L no teste (R$/dia) |
+|---|---|---|---|---|---|
+| 50 | base | 8,0 | −4,78 | 11% | −38,3 |
+| 50 | rich | 6,0 | −4,69 | 15% | −28,2 |
+| 50 | rich sem idade | 3,5 | −4,04 | 23% | −14,0 |
+| 200 | base | 6,7 | −5,26 | 12% | −35,4 |
+| 200 | rich | 5,3 | −5,04 | 15% | −26,5 |
+| 200 | rich sem idade | 5,1 | −4,68 | 15% | −23,9 |
+| 600 | base | 5,3 | −4,63 | 13% | −24,6 |
+| 600 | rich | 5,4 | −4,73 | 12% | −25,5 |
+| 600 | rich sem idade | 5,5 | −4,75 | 12% | −26,1 |
+
+- **Nenhuma combinação é positiva**, nem no limiar escolhido na validação nem em nenhum limiar da grade (a grade completa está em `analysis/contexto/learnability/`). Entrar em um tick qualquer perde ~R$ 13 por entrada (mesmo escolhendo a melhor direção em retrospecto); mesmo os 0,05% de ticks com maior previsão perdem R$ 4–5 por negócio.
+- **Features mais ricas ajudam pouco** (de −38 para −28 R$/dia no horizonte de 50 ticks; sem ganho em 600) e **a idade da cotação não ajuda**: a hipótese de que o edge vinha de cotação defasada não é sustentada por este teste.
+- **O que este teste não cobre:** a saída é por horizonte fixo (uma regra de saída adaptativa, como "sair quando o spread volta a zero", ganha R$ 1–4/dia só nos limiares mais estritos, §7); não há volume, fluxo de ordens nem profundidade do book; o treino usa pregões de 2021 e o teste é de 2023; e execução passiva (ordens limitadas, que não cruzam o book) muda a equação de custo e não foi avaliada.
+
 ## Apêndice: arquivos e reprodução
 
 - **Resultados brutos:** `sdumont_backup_campanha/` (logs em `pairs-rl-logs/`; `src/runs/<execução>/fold1/` com `state.json`, `metadata.json`, `val_curve.csv`, `logs/chunk*/progress.csv`, `eval/*` e checkpoints). Os `*_trades.csv` acima de 5 MB não foram copiados (lista em `EXCLUIDOS_maiores_que_5MB.txt`).
 - **Tabelas e figuras:** `python src/analyze_campanha.py` (no WSL/venv; saída em `sdumont_backup_campanha/analysis/tab_*.md|csv` e `docs/img/v5_*.png`).
+- **Previsibilidade com features ricas (§11):** `python src/learnability_rich.py --train 1-150 --val 362-391 --test 392-421 --stride 10 --costs realistic` (~20 min; `--selftest` confere a contabilidade).
 - **Contexto (oráculo, regra causal, segurar o par):** `python src/opportunity_analysis.py --first 362 --last 391` (e `--first 392 --last 421`, com e sem `--spread-cost`) e `python src/hold_baselines_hedged.py 362 421 <saida.csv>`; resultados em `sdumont_backup_campanha/analysis/contexto/`.
 - **Configuração:** `slurm/submit_adaptive.sh` + `src/campaign_decide.py` (regras de decisão), variáveis em `sdumont_backup_campanha/pairs-rl-logs/campanha_env.sh` (`TRAIN_SIZES=360 N_VAL=30 N_TEST=30 ENT_COEF=0.01 EVAL/CKPT_EVERY_STEPS=5M VEC_ENV=dummy TORCH_THREADS=8 BATCH_SIZE=4096 N_STEPS=2048`).
 - **Código:** branch `estado-simplificado-v4`, commit `6190072` (executado no cluster), mais `src/analyze_campanha.py` e `src/hold_baselines_hedged.py` desta análise.
