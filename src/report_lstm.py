@@ -123,6 +123,52 @@ def safe_auc(y, p):
     return roc_auc_score(y, p) if len(np.unique(y)) == 2 else float("nan")
 
 
+def _key(g):
+    return (round(float(g[0]), 6), round(float(g[1]), 6), round(float(g[2]), 6))
+
+
+def combo_rate_baseline(pred, bal, side):
+    """AUC de um 'modelo' que só conhece a COMBINAÇÃO (sigma, Re, Ri) da amostra:
+    score = taxa de lucro histórica da combinação nos pregões de desenvolvimento
+    (label_balance.csv; não usa o teste). Mede o quanto do AUC vem só do sweep."""
+    if bal is None:
+        return float("nan")
+    b = bal[bal["lado"] == side]
+    rate = {_key((r.sigma, r.Re, r.Ri)): r.taxa_lucro for r in b.itertuples()}
+    by_ci = np.array([rate.get(_key(g), np.nan) for g in pred["grid"]])
+    sc = by_ci[pred["combo_test"]]
+    ok = ~np.isnan(sc)
+    return safe_auc(pred["y_test"][ok], sc[ok]) if ok.any() else float("nan")
+
+
+def within_combo_auc(pred, mask=None):
+    """AUC média DENTRO de cada combinação (ponderada por n): só compara
+    oportunidades da mesma combinação, então a taxa base do sweep não ajuda."""
+    y, sc, c = pred["y_test"], pred["p_test"], pred["combo_test"]
+    num = den = 0.0
+    for ci in np.unique(c):
+        if mask is not None and not mask[ci]:
+            continue
+        m = c == ci
+        a = safe_auc(y[m], sc[m])
+        if not np.isnan(a):
+            num += a * m.sum()
+            den += m.sum()
+    return num / den if den else float("nan")
+
+
+def combo_mask(pred, common):
+    """Máscara (por índice de combinação) das combinações presentes em `common`."""
+    return np.array([_key(g) in common for g in pred["grid"]])
+
+
+def auc_on_common(pred, common):
+    """AUC no teste restrita às combinações comuns a todos os experimentos
+    (necessário para comparar grades diferentes)."""
+    m = combo_mask(pred, common)[pred["combo_test"]]
+    return safe_auc(pred["y_test"][m], pred["p_test"][m]) if m.any() else float("nan")
+
+
 # --------------------------------------------------------------------------
 # utilidades de saída
 # --------------------------------------------------------------------------
@@ -261,17 +307,32 @@ def fig_confusion(done, folds, sides, figs):
     return figs.save(fig, "matriz_confusao_teste")
 
 
-def fig_lift(done, folds, sides, figs):
+def fig_lift(done, folds, sides, figs, bal=None):
     """Taxa de lucro das oportunidades aceitas, aceitando só as de maior probabilidade."""
     cols = fold_colors(len(folds))
     fig, axes = plt.subplots(1, len(sides), figsize=(4.6 * len(sides), 3.6), squeeze=False)
     for j, side in enumerate(sides):
         ax = axes[0][j]
         base = []
+        ref_done = False
         for c, fold in zip(cols, folds):
             p = done.get((fold, side), {}).get("pred")
             if p is None:
                 continue
+            if bal is not None and not ref_done:
+                # referência: ordenar só pela taxa histórica da combinação (sem olhar o mercado)
+                b = bal[bal["lado"] == side]
+                rate = {_key((r.sigma, r.Re, r.Ri)): r.taxa_lucro for r in b.itertuples()}
+                by_ci = np.array([rate.get(_key(g), np.nan) for g in p["grid"]])
+                sc = by_ci[p["combo_test"]]
+                ok = ~np.isnan(sc)
+                if ok.any():
+                    yo = p["y_test"][ok][np.argsort(-sc[ok], kind="stable")]
+                    kk = np.arange(1, len(yo) + 1)
+                    keep0 = kk >= 200
+                    ax.plot((kk / len(yo))[keep0], (np.cumsum(yo) / kk)[keep0], color=C_VAL, lw=1.4, ls="--",
+                            label="só a combinação")
+                    ref_done = True
             o = np.argsort(-p["p_test"])
             y = p["y_test"][o]
             k = np.arange(1, len(y) + 1)
@@ -391,23 +452,24 @@ def combo_table(done, folds, side, split="test"):
     return pd.DataFrame(out)
 
 
-def fig_compare(all_runs, figs):
+def fig_compare(all_runs, figs, common):
     tags = sorted(all_runs)
     sides = sorted({k[1] for t in tags for k in done_tasks(all_runs[t])})
-    fig, axes = plt.subplots(1, len(sides), figsize=(4.6 * len(sides), 0.55 * len(tags) + 1.8), squeeze=False)
+    fig, axes = plt.subplots(1, len(sides), figsize=(4.8 * len(sides), 0.75 * len(tags) + 1.9), squeeze=False)
     for j, side in enumerate(sides):
         ax = axes[0][j]
         for i, tag in enumerate(tags):
             d = done_tasks(all_runs[tag])
-            v = [safe_auc(t["pred"]["y_test"], t["pred"]["p_test"]) for k, t in d.items() if k[1] == side]
+            v = [auc_on_common(t["pred"], common) for k, t in d.items() if k[1] == side]
             if not v:
                 continue
             ax.errorbar(np.nanmean(v), i, xerr=np.nanstd(v), fmt="o", color=C_TEST, ecolor=AXIS, capsize=3)
-            ax.text(np.nanmean(v), i + 0.28, f"{np.nanmean(v):.3f}", ha="center", fontsize=7, color=INK2)
+            ax.text(np.nanmean(v), i - 0.22, f"{np.nanmean(v):.3f}", ha="center", va="bottom", fontsize=7, color=INK2)
         ax.axvline(0.5, color=AXIS, ls="--", lw=1)
         set_ticks(ax, "y", range(len(tags)), tags)
-        ax.set_title(f"{SIDE_PT[side]} · AUC no teste (média ± desvio entre folds)")
-        ax.set_xlabel("AUC")
+        ax.set_ylim(len(tags) - 0.5, -0.7)   # primeiro experimento no topo
+        ax.set_title(f"{SIDE_PT[side]} · AUC no teste")
+        ax.set_xlabel("AUC nas combinações comuns (média ± desvio entre folds)")
     fig.tight_layout()
     return figs.save(fig, "comparacao_experimentos")
 
@@ -416,7 +478,7 @@ def fig_compare(all_runs, figs):
 # relatório
 # --------------------------------------------------------------------------
 
-def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
+def build_report(run_root, tag, out_dir, compare=False, n_boot=300, exclude=("lstm_smoke",), notes=None):
     run_dir = Path(run_root) / tag
     tasks = load_run(run_dir)
     done = done_tasks(tasks)
@@ -428,6 +490,9 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
     figs = Figs(Path(out_dir) / "img", f"lstm_{tag}")
     cfg = next(iter(done.values()))["metrics"].get("config", {})
     L = []   # linhas do markdown
+
+    bal_path = run_dir / "label_balance.csv"
+    bal = pd.read_csv(bal_path) if bal_path.exists() else None
 
     # ---------------- tabela por fold ----------------
     rows = []
@@ -442,6 +507,7 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
             "n val": m["val"]["n"], "n teste": m["test"]["n"],
             "AUC val": m["val"]["auc"], "AUC teste": m["test"]["auc"],
             "IC95% teste": f"[{lo:.3f}; {hi:.3f}]",
+            "AUC só-combo": combo_rate_baseline(p, bal, side), "AUC intra-combo": within_combo_auc(p),
             "acc teste": m["test"]["acc"], "acc majoritária": max(rate, 1 - rate),
             "bal_acc teste": m["test"]["bal_acc"], "prec teste": m["test"]["prec"], "rec teste": m["test"]["rec"],
             "min treinando": h["sec"].sum() / 60,
@@ -458,13 +524,21 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
         d = tab[tab["_side"] == side]
         auc = d["AUC teste"].to_numpy()
         gain = (d["acc teste"] - d["acc majoritária"]).mean()
+        base_auc, intra = d["AUC só-combo"].mean(), d["AUC intra-combo"].mean()
         L.append(f"- **{SIDE_PT[side]}**: AUC no teste = **{auc.mean():.3f}** em média entre {len(d)} fold(s) "
                  f"(desvio {auc.std(ddof=1) if len(auc) > 1 else float('nan'):.3f}; mín {auc.min():.3f}, máx {auc.max():.3f}); "
                  f"{int((auc > 0.5).sum())} de {len(d)} folds acima de 0,5. "
                  f"Último fold: {d.iloc[-1]['AUC teste']:.3f} {d.iloc[-1]['IC95% teste']} (IC95% por bootstrap sobre os pregões). "
-                 f"Acurácia no teste menos a do classificador majoritário: {gain:+.3f} (média).")
+                 f"Acurácia no teste menos a do classificador majoritário: {gain:+.3f} (média). "
+                 f"Referências: AUC de um score que só conhece a combinação (sigma, Re, Ri) = {base_auc:.3f}; "
+                 f"AUC do modelo apenas dentro de cada combinação = {intra:.3f}.")
     L += ["", "Uma AUC de 0,5 é o acaso; o IC95% que contém 0,5 significa que, com esses dados, não dá para distinguir o "
-          "modelo do acaso naquele fold.", ""]
+          "modelo do acaso naquele fold. `AUC só-combo` usa como score a taxa de lucro histórica da combinação (sem olhar o "
+          "mercado): é o que se ganha só por saber quais parâmetros geraram a oportunidade. `AUC intra-combo` compara apenas "
+          "oportunidades da mesma combinação, então o efeito do sweep é removido.", ""]
+
+    if notes:   # leitura manual (arquivo .md à parte, para sobreviver à regeneração do relatório)
+        L += ["---", "", Path(notes).read_text(encoding="utf-8").strip(), ""]
 
     # ---------------- 1. configuração ----------------
     L += ["---", "", "## 1. Configuração e execução", ""]
@@ -498,9 +572,7 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
               + ", ".join(f"fold{f}-{s}" for (f, s) in sorted(tasks) if (f, s) not in done) + ".", ""]
 
     # ---------------- 2. balanceamento ----------------
-    bal_path = run_dir / "label_balance.csv"
-    if bal_path.exists():
-        bal = pd.read_csv(bal_path)
+    if bal is not None:
         L += ["---", "", "## 2. Balanceamento dos labels por combinação", "",
               "Taxa de lucro de cada combinação (pregões de desenvolvimento). Laranja = maioria de prejuízos, "
               "azul = maioria de lucros; o cinza é 50%.", ""]
@@ -540,8 +612,10 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
           "### Utilidade para operar: aceitar só as melhores oportunidades", "",
           "Ordena as oportunidades do teste pela probabilidade prevista de lucro e mostra a taxa de lucro das "
           "aceitas conforme se aceita mais ou menos delas. Se o modelo discrimina, a curva começa acima da taxa base "
-          "e decai até ela.", "",
-          f"![Lift]({fig_lift(done, dfolds, sides, figs)})", "",
+          "e decai até ela. A linha tracejada laranja é a referência **só-combo**: aceitar as oportunidades na ordem da taxa "
+          "de lucro histórica de cada combinação (sigma, Re, Ri), sem olhar o mercado. Só o que fica acima dela é "
+          "informação além do sweep.", "",
+          f"![Lift]({fig_lift(done, dfolds, sides, figs, bal)})", "",
           "### Calibração", "",
           f"![Calibração]({fig_calibration(done, dfolds, sides, figs)})", "",
           "> Com `class_weight` as probabilidades não são calibradas para a taxa real; o que vale é o ranking (AUC/lift), "
@@ -559,22 +633,43 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300):
 
     # ---------------- 6. comparação ----------------
     if compare:
-        all_runs = {d.name: load_run(d) for d in sorted(Path(run_root).glob("*")) if d.is_dir() and load_run(d)}
+        all_runs = {d.name: load_run(d) for d in sorted(Path(run_root).glob("*"))
+                    if d.is_dir() and d.name not in exclude and load_run(d)}
         if len(all_runs) > 1:
+            # combinações comuns a TODOS os experimentos: grades diferentes geram conjuntos de
+            # teste diferentes, então só nelas a comparação é justa
+            grids = [set(_key(g) for g in next(iter(done_tasks(tk).values()))["pred"]["grid"]) for tk in all_runs.values()]
+            common = set.intersection(*grids)
             crow = []
             for t_name, tk in sorted(all_runs.items()):
                 d = done_tasks(tk)
                 for side in ("buy", "sell"):
-                    v = [t["metrics"]["test"]["auc"] for k, t in d.items() if k[1] == side]
-                    b = [t["metrics"]["test"]["bal_acc"] for k, t in d.items() if k[1] == side]
-                    if v:
-                        crow.append({"experimento": t_name, "lado": SIDE_PT[side], "folds": len(v),
-                                     "AUC teste (média)": np.mean(v), "desvio": np.std(v, ddof=1) if len(v) > 1 else float("nan"),
-                                     "bal_acc teste (média)": np.mean(b)})
+                    ks = [k for k in d if k[1] == side]
+                    if not ks:
+                        continue
+                    v = [d[k]["metrics"]["test"]["auc"] for k in ks]
+                    vc = [auc_on_common(d[k]["pred"], common) for k in ks]
+                    ic = [within_combo_auc(d[k]["pred"], combo_mask(d[k]["pred"], common)) for k in ks]
+                    crow.append({"experimento": t_name, "lado": SIDE_PT[side], "folds": len(v),
+                                 "combos": len(next(iter(d.values()))["pred"]["grid"]),
+                                 "AUC teste (todas)": np.mean(v),
+                                 "AUC teste (combos comuns)": np.mean(vc),
+                                 "desvio (folds)": np.std(vc, ddof=1) if len(vc) > 1 else float("nan"),
+                                 "AUC intra-combo (comuns)": np.mean(ic),
+                                 "bal_acc teste": np.mean([d[k]["metrics"]["test"]["bal_acc"] for k in ks])})
             L += ["---", "", "## 6. Comparação entre experimentos", "",
-                  f"![Comparação]({fig_compare(all_runs, figs)})", "", md_table(pd.DataFrame(crow)), "",
-                  "Diferenças menores que o desvio entre folds (ou que a variação entre sementes, se houver um "
-                  "experimento de semente) não devem ser lidas como melhora.", ""]
+                  f"Comparação feita nas **{len(common)} combinações comuns** a todos os experimentos (as grades diferem, "
+                  "e o conjunto de teste de cada um depende da sua grade; na coluna `todas` cada experimento usa a própria).", "",
+                  f"![Comparação]({fig_compare(all_runs, figs, common)})", "", md_table(pd.DataFrame(crow)), ""]
+            if "lstm_base" in all_runs and "lstm_seed2" in all_runs:
+                db, ds = done_tasks(all_runs["lstm_base"]), done_tasks(all_runs["lstm_seed2"])
+                diffs = {sd: [abs(auc_on_common(db[k]["pred"], common) - auc_on_common(ds[k]["pred"], common))
+                              for k in db if k in ds and k[1] == sd] for sd in ("buy", "sell")}
+                L += ["**Ruído entre execuções** (`lstm_base` × `lstm_seed2`, só muda a semente): diferença absoluta média da AUC por fold = "
+                      + "; ".join(f"{SIDE_PT[sd]} {np.mean(v):.3f} (máx {np.max(v):.3f})" for sd, v in diffs.items() if v) + ". "
+                      "Diferenças entre experimentos menores que isso não devem ser lidas como melhora.", ""]
+            else:
+                L += ["Diferenças menores que o desvio entre folds (ou que a variação entre sementes) não devem ser lidas como melhora.", ""]
 
     # ---------------- limitações ----------------
     L += ["---", "", "## 7. Limitações e ressalvas", "",
@@ -605,5 +700,8 @@ if __name__ == "__main__":
     ap.add_argument("--out-dir", default="docs")
     ap.add_argument("--compare", action="store_true", help="inclui a comparação com os demais experimentos de --run-dir")
     ap.add_argument("--boot", type=int, default=300, help="reamostragens do bootstrap por pregão")
+    ap.add_argument("--exclude", nargs="*", default=["lstm_smoke"],
+                    help="experimentos ignorados na comparação (padrão: o teste rápido lstm_smoke)")
+    ap.add_argument("--notes", default=None, help="arquivo .md com a leitura manual, inserido logo após o resumo")
     a = ap.parse_args()
-    build_report(a.run_dir, a.tag, a.out_dir, compare=a.compare, n_boot=a.boot)
+    build_report(a.run_dir, a.tag, a.out_dir, compare=a.compare, n_boot=a.boot, exclude=tuple(a.exclude), notes=a.notes)
