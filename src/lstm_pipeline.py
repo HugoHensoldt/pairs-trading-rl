@@ -58,7 +58,9 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 # Marca o início do processo: os jobs do Slurm têm limite de 20 min e o
 # orçamento de tempo do treino é contado a partir daqui (ver
@@ -514,14 +516,19 @@ def load_samples(orders, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400):
     vazamento: amostras de combinações diferentes no mesmo dia são quase
     cópias umas das outras)."""
     out = {}
+    files = [_cache_file(order, *combo, Periodo, Amostra)
+             for order in orders for combo in param_grid]
     for side in ('buy', 'sell'):
-        Xs, ys = [], []
-        for order in orders:
-            for combo in param_grid:
-                with np.load(_cache_file(order, *combo, Periodo, Amostra)) as z:
-                    if len(z[f'{side}_y']):
-                        Xs.append(z[f'{side}_X'])
-                        ys.append(z[f'{side}_y'])
+        def _read(path, side=side):
+            with np.load(path) as z:
+                y = z[f'{side}_y']
+                return (z[f'{side}_X'], y) if len(y) else None
+        # leitura em threads (I/O + descompressão): milhares de .npz pequenos
+        # levavam >10 min em série; map() preserva a ordem
+        with ThreadPoolExecutor(max_workers=int(os.environ.get("LSTM_LOAD_THREADS", "12"))) as ex:
+            parts = [p for p in ex.map(_read, files) if p is not None]
+        Xs = [p[0] for p in parts]
+        ys = [p[1] for p in parts]
         X = np.concatenate(Xs) if Xs else _stack([])
         y = np.concatenate(ys) if ys else np.empty((0,), dtype=np.float32)
         out[side] = (X, y)
@@ -1010,10 +1017,43 @@ def train_task(fold, side, param_grid=PARAM_GRID, batch_size=256, max_epochs=50,
           f"época {state['epochs_done']} | pedaço {state['chunks'] + 1}", flush=True)
 
     t0 = time.time()
-    train = load_samples(tr_orders, param_grid)[side]
-    val = load_samples(va_orders, param_grid)[side]
-    test = load_samples(test_orders, param_grid)[side]
-    scaled = scale_datasets({'train': train, 'val': val, 'test': test})
+    # Arrays já normalizados ficam num arquivo único no diretório da tarefa: a
+    # retomada (próximo job) lê 1 arquivo em vez de milhares de .npz. A chave
+    # cobre pregões, grade e lado; só é gravado quando a carga foi lenta.
+    import hashlib
+    cache_key = hashlib.md5(repr((
+        [int(o) for o in tr_orders], [int(o) for o in va_orders], [int(o) for o in test_orders],
+        [tuple(map(float, c)) for c in param_grid], side, N_TICKS, list(FEATURE_COLS))).encode()).hexdigest()
+    scaled_path = tdir / "scaled_data.npz"
+    scaled = None
+    if scaled_path.exists():
+        try:
+            with np.load(scaled_path) as z:
+                if str(z['key']) == cache_key:
+                    scaled = {'train': (z['X_train'], z['y_train']), 'val': (z['X_val'], z['y_val']),
+                              'test': (z['X_test'], z['y_test']),
+                              'scaler': SimpleNamespace(mean_=z['mean'], scale_=z['scale'])}
+                    print(f"[fold{fold} {side}] dados normalizados lidos de {scaled_path.name}", flush=True)
+        except Exception as e:   # arquivo truncado por timeout etc.: recarrega
+            print(f"[fold{fold} {side}] cache normalizado ignorado ({e!r})", flush=True)
+            scaled = None
+    if scaled is None:
+        train = load_samples(tr_orders, param_grid)[side]
+        val = load_samples(va_orders, param_grid)[side]
+        test = load_samples(test_orders, param_grid)[side]
+        scaled = scale_datasets({'train': train, 'val': val, 'test': test})
+        del train, val, test
+        if scaled['scaler'] is not None and \
+                time.time() - t0 > float(os.environ.get("LSTM_SCALED_CACHE_MIN_SECONDS", "120")):
+            tmp_path = tdir / "scaled_data.tmp.npz"
+            np.savez(tmp_path, key=cache_key,
+                     X_train=scaled['train'][0], y_train=scaled['train'][1],
+                     X_val=scaled['val'][0], y_val=scaled['val'][1],
+                     X_test=scaled['test'][0], y_test=scaled['test'][1],
+                     mean=scaled['scaler'].mean_, scale=scaled['scaler'].scale_)
+            os.replace(tmp_path, scaled_path)
+            print(f"[fold{fold} {side}] dados normalizados gravados em {scaled_path.name} "
+                  f"({time.time() - t0:.0f}s)", flush=True)
     X_train, y_train = scaled['train']
     X_val, y_val = scaled['val']
     X_test, y_test = scaled['test']
