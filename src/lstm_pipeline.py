@@ -298,7 +298,7 @@ FEATURE_COLS = BASE_FEATURE_COLS + CYCLICAL_COLS   # 11 features no total
 N_TICKS = 120  # janela de ticks anteriores à confirmação do sinal
 
 
-def extract_trade_windows(df, n_ticks=N_TICKS, return_forced=False):
+def extract_trade_windows(df, n_ticks=N_TICKS, return_forced=False, return_pl=False):
     """Percorre o df de um dia e, a cada TRANSIÇÃO real de posição
     (flat -> comprado ou flat -> vendido), recorta a janela
     [i-n_ticks+1 : i] como features e usa o 'lucro' realizado dessa
@@ -312,7 +312,8 @@ def extract_trade_windows(df, n_ticks=N_TICKS, return_forced=False):
     Retorna duas listas de (X, y): uma para compras, outra para vendas.
     Com return_forced=True devolve também, para cada lado, a lista de
     flags "esta negociação foi fechada compulsoriamente no fim do pregão"
-    ([MUDANÇA 5]).
+    ([MUDANÇA 5]). Com return_pl=True devolve, como 4º elemento, o lucro
+    realizado de cada negociação em PONTOS (mesma ordem das amostras).
     """
     df = df.copy()
 
@@ -320,7 +321,7 @@ def extract_trade_windows(df, n_ticks=N_TICKS, return_forced=False):
     sell_entry = (df['posicao'].shift(1) == 0) & (df['posicao'] == -1)
 
     def process_entries(entry_mask, is_buy):
-        X_list, y_list, forced_list = [], [], []
+        X_list, y_list, forced_list, pl_list = [], [], [], []
         for idx in df.index[entry_mask]:
             pos = df.index.get_loc(idx)
             if pos < n_ticks - 1:
@@ -347,11 +348,14 @@ def extract_trade_windows(df, n_ticks=N_TICKS, return_forced=False):
             X_list.append(X)
             y_list.append(y)
             forced_list.append(bool(df.loc[close_idx, 'fechamento_forcado']))
-        return X_list, y_list, forced_list
+            pl_list.append(float(lucro))
+        return X_list, y_list, forced_list, pl_list
 
-    buy_X, buy_y, buy_f = process_entries(buy_entry, is_buy=True)
-    sell_X, sell_y, sell_f = process_entries(sell_entry, is_buy=False)
+    buy_X, buy_y, buy_f, buy_pl = process_entries(buy_entry, is_buy=True)
+    sell_X, sell_y, sell_f, sell_pl = process_entries(sell_entry, is_buy=False)
 
+    if return_pl:
+        return (buy_X, buy_y), (sell_X, sell_y), (buy_f, sell_f), (buy_pl, sell_pl)
     if return_forced:
         return (buy_X, buy_y), (sell_X, sell_y), (buy_f, sell_f)
     return (buy_X, buy_y), (sell_X, sell_y)
@@ -504,6 +508,65 @@ def generate_day_samples(order, param_grid=PARAM_GRID, Periodo=3000, Amostra=240
             sell_X=_stack(sX), sell_y=np.asarray(sy, dtype=np.float32),
             sell_forced=np.asarray(sf, dtype=bool),
         )
+
+
+# Cache LATERAL de P/L por negociação, em pontos (não altera o cache de amostras
+# nem os treinos). Um .npz por (pregão, combinação), com buy_pl/sell_pl na MESMA
+# ordem de buy_y/sell_y do cache de amostras; buy_y/sell_y vão junto só para
+# conferência. Estágio: --stage pl (slurm/submit_lstm_pl.sbatch).
+PL_DIR = Path(os.environ.get("LSTM_PL_DIR", "lstm_pl_cache"))
+
+
+def _pl_file(order, sigma, Re, Ri, Periodo, Amostra):
+    return PL_DIR / _cache_file(order, sigma, Re, Ri, Periodo, Amostra).name
+
+
+def generate_day_pl(order, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400):
+    """Regera a heurística de UM pregão para todas as combinações e grava o
+    lucro em pontos de cada negociação. Se a amostra correspondente já existe no
+    cache principal, confere que o alinhamento bate (mesmo nº de negociações e
+    mesmo sinal do lucro); qualquer divergência é erro, nunca dado desalinhado."""
+    PL_DIR.mkdir(parents=True, exist_ok=True)
+    pending = [c for c in param_grid if not _pl_file(order, *c, Periodo, Amostra).exists()]
+    if not pending:
+        return
+
+    base = load_day_base(order, Periodo, Amostra)
+    for sigma, Re, Ri in pending:
+        df = apply_heuristic(base, sigma=sigma, Re=Re, Ri=Ri)
+        (_, by), (_, sy), (bf, sf), (bpl, spl) = extract_trade_windows(
+            df, return_forced=True, return_pl=True)
+        out = dict(buy_pl=np.asarray(bpl, dtype=np.float32), buy_y=np.asarray(by, dtype=np.float32),
+                   buy_forced=np.asarray(bf, dtype=bool),
+                   sell_pl=np.asarray(spl, dtype=np.float32), sell_y=np.asarray(sy, dtype=np.float32),
+                   sell_forced=np.asarray(sf, dtype=bool))
+        ref = _cache_file(order, sigma, Re, Ri, Periodo, Amostra)
+        if ref.exists():
+            with np.load(ref) as z:   # npz é lazy: só lê y e forced, não o X
+                for side in SIDES:
+                    if not (np.array_equal(z[f'{side}_y'], out[f'{side}_y']) and
+                            np.array_equal(z[f'{side}_forced'], out[f'{side}_forced'])):
+                        raise RuntimeError(f"P/L desalinhado do cache de amostras: pregão {order}, "
+                                           f"(sigma, Re, Ri)=({sigma:g}, {Re:g}, {Ri:g}), lado {side}")
+        final = _pl_file(order, sigma, Re, Ri, Periodo, Amostra)
+        tmp = final.with_name(final.stem + ".tmp.npz")
+        np.savez_compressed(tmp, **out)
+        os.replace(tmp, final)   # atômico: retomada nunca vê arquivo pela metade
+
+
+def load_sample_pl(orders, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400):
+    """Lucro em pontos de cada amostra, na MESMA ordem de load_samples(orders,
+    param_grid) e portanto de y/p em predictions.npz. Retorna {'buy': array,
+    'sell': array} em float32."""
+    out = {}
+    for side in SIDES:
+        parts = []
+        for order in orders:
+            for combo in param_grid:
+                with np.load(_pl_file(order, *combo, Periodo, Amostra)) as z:
+                    parts.append(z[f'{side}_pl'])
+        out[side] = np.concatenate(parts) if parts else np.empty(0, dtype=np.float32)
+    return out
 
 
 def load_samples(orders, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400):
@@ -1203,21 +1266,29 @@ def _generate_worker(order):
         return order, f"{type(e).__name__}: {e}"
 
 
-def generate_all(orders, workers=1):
+def _generate_pl_worker(order):
+    try:
+        generate_day_pl(order)
+        return order, None
+    except Exception as e:
+        return order, f"{type(e).__name__}: {e}"
+
+
+def generate_all(orders, workers=1, worker=_generate_worker):
     """Gera (ou reaproveita do cache) as amostras de todos os pregões, em
     paralelo por pregão. Falha ao final, listando os pregões com erro."""
     failed = []
     if workers > 1:
         import multiprocessing as mp
         with mp.Pool(workers) as pool:
-            results = pool.imap_unordered(_generate_worker, orders)
+            results = pool.imap_unordered(worker, orders)
             for i, (order, err) in enumerate(results, start=1):
                 print(f"[{i}/{len(orders)}] pregão {order}" + (f"  ERRO: {err}" if err else ""), flush=True)
                 if err:
                     failed.append(order)
     else:
         for i, order in enumerate(orders, start=1):
-            _, err = _generate_worker(order)
+            _, err = worker(order)
             print(f"[{i}/{len(orders)}] pregão {order}" + (f"  ERRO: {err}" if err else ""), flush=True)
             if err:
                 failed.append(order)
@@ -1233,7 +1304,7 @@ def generate_all(orders, workers=1):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--stage", default="all",
-                        choices=["all", "generate", "report", "train", "pending", "aggregate", "compare"],
+                        choices=["all", "generate", "report", "train", "pending", "aggregate", "compare", "pl"],
                         help="all = fluxo serial original (gera, relatório e treina os 5 folds "
                              "num único processo); os demais são os estágios do Santos Dumont")
     parser.add_argument("--report-only", action="store_true",
@@ -1262,6 +1333,9 @@ if __name__ == "__main__":
         aggregate_results()
     elif args.stage == "compare":
         compare_runs()
+    elif args.stage == "pl":
+        print(f"P/L por negociação: {len(PARAM_GRID)} combinações x {len(ALL_ORDERS)} pregões -> {PL_DIR}")
+        generate_all(ALL_ORDERS, workers=args.workers, worker=_generate_pl_worker)
     elif args.stage == "train":
         if not args.fold or not args.side:
             parser.error("--stage train exige --fold e --side")
