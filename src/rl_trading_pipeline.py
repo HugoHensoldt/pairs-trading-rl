@@ -85,6 +85,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalC
 from stable_baselines3.common.logger import configure as configure_logger
 
 from config import data_path, POINT_VALUE_BRL
+from synthetic_pair import SYNTH_BASE
 
 # mesma lógica do OMP_NUM_THREADS acima, mas para o processo PRINCIPAL
 # (que roda o forward/backward da rede via torch, concorrendo por CPU com
@@ -200,6 +201,10 @@ def process_day_cached(order, Periodo=3000):
     # pedem os mesmos dias -- carrega cada um uma vez só (o df não é
     # modificado por ninguém, só lido)
     if (order, Periodo) in _DAY_MEMO:
+        return _DAY_MEMO[(order, Periodo)]
+    if order >= SYNTH_BASE:      # pregão SINTÉTICO (ver synthetic_pair.py); sem cache em disco
+        from synthetic_pair import synthetic_day
+        _DAY_MEMO[(order, Periodo)] = synthetic_day(order)
         return _DAY_MEMO[(order, Periodo)]
     # _v2: inclui as cotações do BOVA11 (bbid/bask), usadas pelo env hedgeado
     path = os.path.join(_day_cache_dir(), f"day{order}_p{Periodo}_v2.npz")
@@ -327,6 +332,102 @@ def build_state_features(df):
     return np.stack([spread_compra, spread_venda], axis=1)
 
 
+RAW_HORIZONS = (10, 100, 1000, 4000)      # ticks; retornos GENÉRICOS por ativo
+RAW_VOL_WINDOW = 100
+
+
+def raw_feature_names(levels=None, doy=None):
+    levels = (os.environ.get("RAW_LEVELS", "1") == "1") if levels is None else levels
+    doy = (os.environ.get("RAW_DOY", "0") == "1") if doy is None else doy
+    names = []
+    if levels:
+        names += ["log_bid_win", "log_ask_win", "log_bid_bova", "log_ask_bova"]
+    for h in RAW_HORIZONS:
+        names += [f"ret{h}_win", f"ret{h}_bova"]
+    names += ["spread_rel_win", "spread_rel_bova", f"vol{RAW_VOL_WINDOW}_win", f"vol{RAW_VOL_WINDOW}_bova",
+              "sessao_sin", "sessao_cos", "diasemana_sin", "diasemana_cos"]
+    if doy:
+        names += ["diaano_sin", "diaano_cos"]
+    return names
+
+
+def build_raw_features(df, levels=None, doy=None):
+    """Estado "só preços" (RAW): os 4 preços atuais (bid/ask do WIN e do BOVA11, em
+    log) mais features GENÉRICAS de mercado, nenhuma delas construída para
+    arbitragem: retorno de cada ativo em vários horizontes, spread bid-ask
+    relativo, volatilidade realizada de cada ativo e calendário cíclico (posição
+    na sessão, dia da semana e, opcional, dia do ano).
+
+    NÃO há preço justo, razão, resíduo, spread entre os ativos nem retorno
+    relativo: o agente precisa DESCOBRIR (por exemplo, que ret_h_win - ret_h_bova
+    é a variação da razão em h ticks) o que a cointegração/cópula/OLS calculam.
+
+    Tudo é causal (só passado/presente). Nos primeiros ticks do dia o retorno em
+    h ticks usa o primeiro preço disponível (índice t-h truncado em 0). Volume
+    não entra (não está no cache de dias).
+
+    Variáveis de ambiente (ablações): RAW_LEVELS=0 tira os 4 níveis de preço;
+    RAW_DOY=1 acrescenta o dia do ano (com ~360 dias de treino identifica cada
+    dia e permite decorar datas)."""
+    levels = (os.environ.get("RAW_LEVELS", "1") == "1") if levels is None else levels
+    doy = (os.environ.get("RAW_DOY", "0") == "1") if doy is None else doy
+    bid = df["bid"].to_numpy(dtype=float)
+    ask = df["ask"].to_numpy(dtype=float)
+    bbid = df["bbid"].to_numpy(dtype=float)
+    bask = df["bask"].to_numpy(dtype=float)
+    n = len(bid)
+    wmid = 0.5 * (bid + ask)
+    bmid = 0.5 * (bbid + bask)
+    lw, lb = np.log(wmid), np.log(bmid)
+    idx = np.arange(n)
+    cols = []
+    if levels:
+        cols += [np.log(bid), np.log(ask), np.log(bbid), np.log(bask)]
+    for h in RAW_HORIZONS:
+        j = np.maximum(idx - h, 0)
+        cols += [lw - lw[j], lb - lb[j]]
+    cols += [(ask - bid) / wmid, (bask - bbid) / bmid]
+    for lx in (lw, lb):
+        r = np.diff(lx, prepend=lx[0])
+        v = pd.Series(r).rolling(RAW_VOL_WINDOW, min_periods=2).std().fillna(0.0).to_numpy()
+        cols.append(v)
+    dt = pd.to_datetime(df["datahora"])
+    minutes = (dt.dt.hour * 60 + dt.dt.minute + dt.dt.second / 60.0).to_numpy(dtype=float)
+    frac = np.clip((minutes - (10 * 60 + 20)) / 370.0, 0.0, 1.0)          # sessão 10:20-16:30
+    cols += [np.sin(2 * np.pi * frac), np.cos(2 * np.pi * frac)]
+    dow = dt.dt.dayofweek.to_numpy(dtype=float)                           # seg=0 .. sex=4
+    cols += [np.sin(2 * np.pi * dow / 5.0), np.cos(2 * np.pi * dow / 5.0)]
+    if doy:
+        d = dt.dt.dayofyear.to_numpy(dtype=float) / 365.25
+        cols += [np.sin(2 * np.pi * d), np.cos(2 * np.pi * d)]
+    return np.stack(cols, axis=1)
+
+
+def state_kind():
+    """'spread' (padrão: os 2 spreads contra o preço justo, v4) ou 'raw' (só preços)."""
+    return os.environ.get("STATE_KIND", "spread")
+
+
+def build_features(df):
+    """Features de mercado do estado conforme STATE_KIND."""
+    return build_raw_features(df) if state_kind() == "raw" else build_state_features(df)
+
+
+def state_feature_names():
+    return raw_feature_names() if state_kind() == "raw" else list(STATE_FEATURE_NAMES)
+
+
+def build_bench_features(df):
+    """Referência clássica por tick: [(ask - Wbjusto), (bid - Wajusto)] em MÚLTIPLOS
+    do custo de ida e volta do par (pts de WIN). NÃO entra no estado do agente no
+    modo raw; só rotula os negócios (força do sinal na entrada) na avaliação."""
+    wmid = 0.5 * (df["bid"].to_numpy(dtype=float) + df["ask"].to_numpy(dtype=float))
+    cost_pts = (2 * WIN_COST_PER_SIDE_BRL + 2 * BOVA_COST_PCT_PER_SIDE * wmid / HEDGE_FACTOR) / POINT_VALUE_BRL
+    s_buy = df["ask"].to_numpy(dtype=float) - df["Wbjusto"].to_numpy(dtype=float)
+    s_sell = df["bid"].to_numpy(dtype=float) - df["Wajusto"].to_numpy(dtype=float)
+    return np.stack([s_buy / cost_pts, s_sell / cost_pts], axis=1)
+
+
 def fit_feature_scaler(feature_matrices):
     """Ajusta média/desvio-padrão usando SOMENTE as matrizes de treino
     (lista de arrays, uma por dia). Retorna (mean, std) para normalizar
@@ -381,7 +482,7 @@ class ArbitrageTradingEnv(gym.Env):
 
     def __init__(self, df, feature_matrix, transaction_fee=2.5,
                  reward_scale=1.0, max_loss_per_position=None,
-                 record_equity=False, track_details=False):
+                 record_equity=False, track_details=False, bench=None):
         super().__init__()
         assert len(df) == len(feature_matrix)
         # só o tamanho do pregão é guardado (não o DataFrame): cada um dos
@@ -404,6 +505,9 @@ class ArbitrageTradingEnv(gym.Env):
         self.bid = df['bid'].to_numpy(dtype=float)
         self.ask = df['ask'].to_numpy(dtype=float)
         self.feature_matrix = feature_matrix.astype(np.float32)
+        # bench: 2 colunas que rotulam os negócios em `trade_details` (por padrão as 2
+        # primeiras colunas do estado; no modo raw vêm de build_bench_features)
+        self.bench = feature_matrix if bench is None else bench
         self.transaction_fee = transaction_fee
         self.reward_scale = reward_scale
         # stop-loss por posição: regra FIXA (não aprendida), desligada por
@@ -505,8 +609,8 @@ class ArbitrageTradingEnv(gym.Env):
             o, c = self._open_tick, self.t
             self.trade_details.append((
                 self.position, o, c, net_realized,
-                self.feature_matrix[o, 0], self.feature_matrix[o, 1],
-                self.feature_matrix[c, 0], self.feature_matrix[c, 1],
+                self.bench[o, 0], self.bench[o, 1],
+                self.bench[c, 0], self.bench[c, 1],
                 self.mid[o] - self.fair[o], self.mid[c] - self.fair[c],
                 self.fair[o], self.fair[c]))
         if net_realized > 0:
@@ -667,7 +771,7 @@ class HedgedPairEnv(gym.Env):
 
     def __init__(self, df, feature_matrix, transaction_fee=1.0, reward_scale=None,
                  max_loss_per_position=None, record_equity=False, track_details=False,
-                 include_spread_cost=None):
+                 include_spread_cost=None, bench=None):
         super().__init__()
         assert len(df) == len(feature_matrix)
         self.n_day_ticks = len(df)
@@ -686,6 +790,9 @@ class HedgedPairEnv(gym.Env):
         # mids calculados sob demanda (_wm/_bm): com dezenas de envs x centenas
         # de dias por processo, arrays de mid extras custariam GBs
         self.feature_matrix = feature_matrix.astype(np.float32)
+        # bench: 2 colunas que rotulam os negócios em `trade_details` (por padrão as 2
+        # primeiras colunas do estado; no modo raw vêm de build_bench_features)
+        self.bench = feature_matrix if bench is None else bench
         self.n_features = feature_matrix.shape[1]
         if self.track_details:
             self.mid = (self.win_bid + self.win_ask) / 2
@@ -770,8 +877,8 @@ class HedgedPairEnv(gym.Env):
             o = self._open_tick
             self.trade_details.append((
                 self.position, o, t, net,
-                self.feature_matrix[o, 0], self.feature_matrix[o, 1],
-                self.feature_matrix[t, 0], self.feature_matrix[t, 1],
+                self.bench[o, 0], self.bench[o, 1],
+                self.bench[t, 0], self.bench[t, 1],
                 self._wm(o) - self.fair[o], self._wm(t) - self.fair[t],
                 self.fair[o], self.fair[t]))
         self.position = 0
@@ -887,7 +994,7 @@ class SpreadRewardEnv(gym.Env):
 
     def __init__(self, df, feature_matrix, transaction_fee=1.0, reward_scale=None,
                  max_loss_per_position=None, record_equity=False, track_details=False,
-                 include_spread_cost=None, exec_cost=None):
+                 include_spread_cost=None, exec_cost=None, bench=None):
         super().__init__()
         assert len(df) == len(feature_matrix)
         self.n_day_ticks = len(df)
@@ -910,6 +1017,9 @@ class SpreadRewardEnv(gym.Env):
         self.wbj = df['Wbjusto'].to_numpy(dtype=float)
         self.waj = df['Wajusto'].to_numpy(dtype=float)
         self.feature_matrix = feature_matrix.astype(np.float32)
+        # bench: 2 colunas que rotulam os negócios em `trade_details` (por padrão as 2
+        # primeiras colunas do estado; no modo raw vêm de build_bench_features)
+        self.bench = feature_matrix if bench is None else bench
         self.n_features = feature_matrix.shape[1]
         if self.track_details:
             self.mid = (self.win_bid + self.win_ask) / 2
@@ -1007,8 +1117,8 @@ class SpreadRewardEnv(gym.Env):
             o = self._open_tick
             self.trade_details.append((
                 self.position, o, t, net,
-                self.feature_matrix[o, 0], self.feature_matrix[o, 1],
-                self.feature_matrix[t, 0], self.feature_matrix[t, 1],
+                self.bench[o, 0], self.bench[o, 1],
+                self.bench[t, 0], self.bench[t, 1],
                 self._wm(o) - self.fair[o], self._wm(t) - self.fair[t],
                 self.fair[o], self.fair[t]))
         self.position = 0
@@ -1159,7 +1269,7 @@ def build_day_envs(orders, mean, std, transaction_fee=2.5,
     envs = []
     for order in orders:
         df = process_day_cached(order)
-        feat = build_state_features(df)
+        feat = build_features(df)
         feat = apply_scaler(feat, mean, std)
         envs.append(_env_class()(df, feat,
                                          transaction_fee=transaction_fee,
@@ -1495,9 +1605,10 @@ def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
     from collections import deque
 
     df = process_day_cached(order)
-    feat = apply_scaler(build_state_features(df), mean, std)
+    feat = apply_scaler(build_features(df), mean, std)
+    bench = build_bench_features(df) if state_kind() == "raw" else None
     env = _env_class()(df, feat, transaction_fee=fee, record_equity=record_equity,
-                       track_details=True)
+                       track_details=True, bench=bench)
     policy = _make_policy(spec, model, order)
     pending = deque([0] * latency)
 
@@ -1506,7 +1617,7 @@ def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
     while not done:
         if latency:
             obs = obs.copy()
-            obs[2] = _ACTION_TO_POS[pending[-1]]
+            obs[getattr(env, "n_features", 2)] = _ACTION_TO_POS[pending[-1]]      # índice da posição
         action = policy(obs)
         if latency:
             pending.append(action)
@@ -1856,7 +1967,8 @@ def write_metadata(run_dir, fold, hparams, extra):
                      "pandas": pd.__version__, "torch": torch.__version__,
                      "stable_baselines3": stable_baselines3.__version__,
                      "gymnasium": gym.__version__},
-        "state_features": STATE_FEATURE_NAMES + ["posicao", "pl_nao_realizado_norm"],
+        "state_kind": state_kind(),
+        "state_features": state_feature_names() + ["posicao", "pl_nao_realizado_norm"],
         **extra,
     }
     with open(os.path.join(run_dir, "metadata.json"), "w") as fh:
@@ -1864,7 +1976,7 @@ def write_metadata(run_dir, fold, hparams, extra):
 
 
 def _day_features(order):
-    return build_state_features(process_day_cached(order))
+    return build_features(process_day_cached(order))
 
 
 def load_or_fit_scaler(run_dir, train_orders, n_workers):
@@ -2006,6 +2118,11 @@ def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds
         write_state(run_dir, _new_state())
         write_metadata(run_dir, fold, hparams, {"seed": seed, "transaction_fee": transaction_fee,
                                                  "env_kind": os.environ.get("ENV_KIND", "hedged"),
+                                                 "raw_levels": os.environ.get("RAW_LEVELS", "1"),
+                                                 "raw_doy": os.environ.get("RAW_DOY", "0"),
+                                                 "synthetic": os.environ.get("SYNTHETIC", ""),
+                                                 "synth_cfg": (__import__("synthetic_pair").synth_config()
+                                                               if os.environ.get("SYNTHETIC") else None),
                                                  "exclude_orders": os.environ.get("EXCLUDE_ORDERS", "338,463"),
                                                  "select_metric": os.environ.get("SELECT_METRIC", "auto"),
                                                  "hedge_reward_scale": os.environ.get("HEDGE_REWARD_SCALE", "5.0"),
@@ -2139,8 +2256,13 @@ def _eval_part1(models, ref_name, sets, mean, std, fee, out_dir, has_time, recor
                                     fee=fee, out_dir=out_dir))
 
     # 2) baselines
-    for bname, spec in (("flat", ("flat",)), ("threshold1.0", ("threshold", 1.0)),
-                        ("random", ("random", 0))):
+    # a regra de limiar lê os spreads do estado; no modo raw eles não existem (a
+    # comparação com regras clássicas está em diagnose_agent.py)
+    baselines = [("flat", ("flat",))]
+    if state_kind() != "raw":
+        baselines.append(("threshold1.0", ("threshold", 1.0)))
+    baselines.append(("random", ("random", 0)))
+    for bname, spec in baselines:
         for sname, orders in sets.items():
             if not has_time(120):
                 continue
@@ -2228,6 +2350,10 @@ if __name__ == "__main__":
     max_order = int(os.environ.get("MAX_ORDER", "488"))
     exclude = {int(x) for x in os.environ.get("EXCLUDE_ORDERS", "338,463").split(",") if x.strip()}
     all_orders = [o for o in range(1, max_order + 1) if o not in exclude]
+    if os.environ.get("SYNTHETIC"):
+        # pregões sintéticos (SYNTH_KIND=coint|null, ver synthetic_pair.py)
+        os.environ.setdefault("SYNTH_KIND", os.environ["SYNTHETIC"])
+        all_orders = [SYNTH_BASE + i for i in range(int(os.environ.get("SYNTH_DAYS", "450")))]
     max_pregoes = os.environ.get("MAX_PREGOES")
     if max_pregoes:
         all_orders = all_orders[:int(max_pregoes)]
