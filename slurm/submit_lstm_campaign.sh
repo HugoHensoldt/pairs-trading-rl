@@ -25,6 +25,10 @@ set -uo pipefail   # sem -e: falha de um experimento não pode abortar a campanh
 
 cd "$(dirname "$0")/.."
 
+# Prefixo dos experimentos (tags = <prefixo>_<experimento>). Use um prefixo NOVO a cada campanha com
+# grade/teste diferentes (ex.: CAMPAIGN_PREFIX=lstm_v2): tarefas já concluídas de uma tag são puladas.
+PREFIX="${CAMPAIGN_PREFIX:-lstm}"
+
 # "tag|VAR=valor VAR=valor ..."  (vazio = configuração padrão do código)
 EXPERIMENTS=(
     "base|"
@@ -42,7 +46,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     echo ""
     echo "################ experimento: $tag  [$envs]  ($(date)) ################"
     # shellcheck disable=SC2086
-    if ! env $envs LSTM_RUN_TAG="lstm_$tag" bash slurm/submit_lstm.sh; then
+    if ! env $envs LSTM_RUN_TAG="${PREFIX}_$tag" bash slurm/submit_lstm.sh; then
         echo "AVISO: experimento $tag terminou com erro; seguindo para o próximo."
     fi
 done
@@ -52,5 +56,6 @@ echo "################ comparação entre experimentos ($(date)) ###############
 module load python/3.10.16_sequana
 source "/scratch/ppg-lncc/$USER/envs/pairs-lstm/bin/activate"
 export LSTM_RUN_DIR="${LSTM_RUN_DIR:-/scratch/ppg-lncc/$USER/lstm_runs}"
-export LSTM_RUN_TAG="lstm_base"
+export LSTM_RUN_TAG="${PREFIX}_base"
+export LSTM_COMPARE_PREFIX="$PREFIX"
 (cd src && CUDA_VISIBLE_DEVICES="" python lstm_pipeline.py --stage compare)

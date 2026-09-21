@@ -458,7 +458,9 @@ def _grid_from_env(name, default):
     return [float(v) for v in raw.split(",")] if raw else default
 
 
-SIGMA_GRID = _grid_from_env("LSTM_SIGMA_GRID", [1.4, 1.6, 1.8])
+# sigma 2.2-2.6 (antes 1.4-1.8): a triagem da heurística (src/analyze_spread_vs_edge.py) mostrou que o
+# ganho bruto por trade cresce com sigma, enquanto o spread bid-ask custa ~5 pts fixos por trade.
+SIGMA_GRID = _grid_from_env("LSTM_SIGMA_GRID", [2.2, 2.4, 2.6])
 RE_GRID = _grid_from_env("LSTM_RE_GRID", [0.5, 0.75, 0.9])
 RI_GRID = _grid_from_env("LSTM_RI_GRID", [0.5, 1.0, 1.5])
 
@@ -960,15 +962,21 @@ SIDES = ('buy', 'sell')
 
 # Pregões 1..488 em ordem cronológica. Os pregões 338 e 463 estão ruins e ficam de
 # fora por padrão (restam 486). O teste final = últimos 15% (~72 pregões).
-# Para mudar sem editar o código: LSTM_EXCLUDE_ORDERS="338,463,<outro>" (ou "" p/ nenhum).
-_EXCLUDED = {int(v) for v in os.environ.get("LSTM_EXCLUDE_ORDERS", "338,463").split(",") if v}
+# Também ficam de fora, por padrão, 168, 304, 336 e 371: cotações impossíveis (bid > ask, saltos de
+# 7.000 a 112.000 pts) achadas por src/scan_bad_sessions.py. Para mudar sem editar o código:
+# LSTM_EXCLUDE_ORDERS="338,463,<outro>" (ou "" p/ nenhum).
+_EXCLUDED = {int(v) for v in os.environ.get("LSTM_EXCLUDE_ORDERS", "168,304,336,338,371,463").split(",") if v}
 LAST_ORDER = int(os.environ.get("LSTM_LAST_ORDER", "488"))   # último pregão usado (os dados vão de 1 a 488)
 ALL_ORDERS = [o for o in range(1, LAST_ORDER + 1) if o not in _EXCLUDED]
 
 
-def split_orders(orders=None, test_frac=0.15):
-    """[MUDANÇA 1] Últimos 15% = teste final; o restante = base do TimeSeriesSplit."""
+TEST_FRAC = float(os.environ.get("LSTM_TEST_FRAC", "0.30"))   # antes 0.15; dobrado a pedido
+
+
+def split_orders(orders=None, test_frac=None):
+    """[MUDANÇA 1] Últimos TEST_FRAC (padrão 30%) = teste final; o restante = base do TimeSeriesSplit."""
     orders = list(ALL_ORDERS if orders is None else orders)
+    test_frac = TEST_FRAC if test_frac is None else test_frac
     n_dev = len(orders) - int(len(orders) * test_frac)
     return orders[:n_dev], orders[n_dev:]
 
@@ -1241,7 +1249,10 @@ def compare_runs(csv_path=None):
     os lstm_cv_results.csv já gerados em LSTM_RUN_DIR/<tag>/."""
     root = RUN_ROOT.parent
     frames = []
-    for csv in sorted(root.glob("*/lstm_cv_results.csv")):
+    # LSTM_COMPARE_PREFIX restringe a comparação a uma campanha (ex.: "lstm_v2"), já que experimentos
+    # com grades/testes diferentes não são comparáveis.
+    prefix = os.environ.get("LSTM_COMPARE_PREFIX", "")
+    for csv in sorted(root.glob(prefix + "*/lstm_cv_results.csv")):
         d = pd.read_csv(csv)
         d.insert(0, 'experimento', csv.parent.name)
         frames.append(d)

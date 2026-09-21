@@ -478,7 +478,7 @@ def fig_compare(all_runs, figs, common):
 # relatório
 # --------------------------------------------------------------------------
 
-def build_report(run_root, tag, out_dir, compare=False, n_boot=300, exclude=("lstm_smoke",), notes=None):
+def build_report(run_root, tag, out_dir, compare=False, n_boot=300, exclude=("lstm_smoke",), notes=None, compare_prefix=""):
     run_dir = Path(run_root) / tag
     tasks = load_run(run_dir)
     done = done_tasks(tasks)
@@ -634,7 +634,7 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300, exclude=("ls
     # ---------------- 6. comparação ----------------
     if compare:
         all_runs = {d.name: load_run(d) for d in sorted(Path(run_root).glob("*"))
-                    if d.is_dir() and d.name not in exclude and load_run(d)}
+                    if d.is_dir() and d.name not in exclude and d.name.startswith(compare_prefix) and load_run(d)}
         if len(all_runs) > 1:
             # combinações comuns a TODOS os experimentos: grades diferentes geram conjuntos de
             # teste diferentes, então só nelas a comparação é justa
@@ -702,6 +702,9 @@ if __name__ == "__main__":
     ap.add_argument("--boot", type=int, default=300, help="reamostragens do bootstrap por pregão")
     ap.add_argument("--exclude", nargs="*", default=["lstm_smoke"],
                     help="experimentos ignorados na comparação (padrão: o teste rápido lstm_smoke)")
+    ap.add_argument("--compare-prefix", default="",
+                    help="só compara experimentos cujo nome começa com este prefixo (ex.: lstm_v2_)")
     ap.add_argument("--notes", default=None, help="arquivo .md com a leitura manual, inserido logo após o resumo")
     a = ap.parse_args()
-    build_report(a.run_dir, a.tag, a.out_dir, compare=a.compare, n_boot=a.boot, exclude=tuple(a.exclude), notes=a.notes)
+    build_report(a.run_dir, a.tag, a.out_dir, compare=a.compare, n_boot=a.boot, exclude=tuple(a.exclude), notes=a.notes,
+                 compare_prefix=a.compare_prefix)
