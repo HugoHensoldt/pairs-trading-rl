@@ -771,7 +771,7 @@ class HedgedPairEnv(gym.Env):
 
     def __init__(self, df, feature_matrix, transaction_fee=1.0, reward_scale=None,
                  max_loss_per_position=None, record_equity=False, track_details=False,
-                 include_spread_cost=None, bench=None):
+                 include_spread_cost=None, bench=None, reward_clip=None):
         super().__init__()
         assert len(df) == len(feature_matrix)
         self.n_day_ticks = len(df)
@@ -780,6 +780,16 @@ class HedgedPairEnv(gym.Env):
         self.cost_scale = float(transaction_fee)
         self.reward_scale = (float(os.environ.get("HEDGE_REWARD_SCALE", "5.0"))
                              if reward_scale is None else float(reward_scale))
+        # reward_clip (R$, já com reward_scale aplicado): limita o valor ABSOLUTO da
+        # recompensa que o PPO vê por tick. Motivação (ver docs/relatorio_diagnostico_
+        # sintetico.md): a política aleatória do início faz milhares de negócios por
+        # episódio, cada um custando ~R$10-12 -- um castigo tão grande e tão presente
+        # em qualquer estado que o gradiente de "parar de operar" domina o de "operar
+        # bem" antes deste ser explorado. O clipping não muda o P/L real (`total_reward`
+        # continua o valor cheio, sem clip); só limita o que entra no cálculo de
+        # vantagem do PPO. None/0 (default) preserva o comportamento anterior.
+        rc = os.environ.get("HEDGE_REWARD_CLIP", "0") if reward_clip is None else reward_clip
+        self.reward_clip = float(rc) if float(rc) > 0 else None
         self.include_spread_cost = ((os.environ.get("HEDGE_SPREAD_COST", "0") == "1")
                                     if include_spread_cost is None else include_spread_cost)
         # arrays numpy (sem guardar o DataFrame; ver ArbitrageTradingEnv)
@@ -945,7 +955,10 @@ class HedgedPairEnv(gym.Env):
         info = {"n_trades_closed": self.n_trades_closed,
                 "n_trades_won": self.n_trades_won,
                 "n_stop_loss_triggers": 0}
-        return obs, reward * self.reward_scale, terminated, truncated, info
+        reward_out = reward * self.reward_scale
+        if self.reward_clip is not None:
+            reward_out = float(np.clip(reward_out, -self.reward_clip, self.reward_clip))
+        return obs, reward_out, terminated, truncated, info
 
 
 # --------------------------------------------------------------------------
@@ -1255,6 +1268,14 @@ class MultiDayEnv(gym.Env):
 
     def step(self, action):
         return self.current_env.step(action)
+
+    def set_cost_scale(self, value):
+        """Curva de custo (ver CostCurriculumCallback): muda `cost_scale` em TODOS
+        os day_envs (não só o atual), pois o próximo reset pode sortear qualquer um.
+        Alcançado via VecEnv.env_method, que atravessa o Monitor por __getattr__."""
+        for e in self.day_envs:
+            if hasattr(e, "cost_scale"):
+                e.cost_scale = value
 
 
 def build_day_envs(orders, mean, std, transaction_fee=2.5,
@@ -2100,6 +2121,44 @@ class TradeStatsCallback(BaseCallback):
             self._trades, self._wins = [], []
 
 
+class CostCurriculumCallback(BaseCallback):
+    """Curva de custo: rampa LINEAR do multiplicador de custo de transação
+    (`cost_scale`, ver HedgedPairEnv/SpreadRewardEnv) de `start` até 1.0 ao longo
+    dos primeiros `ramp_steps` timesteps. Motivação (ver docs/relatorio_diagnostico_
+    sintetico.md, §0.4 e §6): no início do treino a política é quase aleatória e
+    faz milhares de negócios por episódio; com custo cheio, isso pune tão forte e
+    tão cedo que o gradiente de "parar de operar" domina antes do agente explorar
+    o regime lucrativo. Começar com custo baixo dá tempo de descobrir QUANDO
+    operar antes de aprender a temer operar.
+
+    Usa `num_timesteps` (persiste entre chunks via reset_num_timesteps=False), então
+    a rampa continua corretamente entre chunks retomados. Alcança os day_envs via
+    VecEnv.env_method("set_cost_scale", ...) -- ver MultiDayEnv.set_cost_scale.
+    """
+
+    def __init__(self, ramp_steps, start=0.0, verbose=1):
+        super().__init__(verbose)
+        self.ramp_steps = max(1, ramp_steps)
+        self.start = start
+        self._last_value = None
+
+    def _set(self, value):
+        if self._last_value is None or abs(value - self._last_value) > 1e-3:
+            self.training_env.env_method("set_cost_scale", value)
+            self._last_value = value
+            if self.verbose:
+                print(f"[CostCurriculumCallback @ {self.num_timesteps:,}] cost_scale = {value:.3f}")
+
+    def _on_training_start(self):
+        frac = min(1.0, self.num_timesteps / self.ramp_steps)
+        self._set(self.start + frac * (1.0 - self.start))
+
+    def _on_step(self):
+        frac = min(1.0, self.num_timesteps / self.ramp_steps)
+        self._set(self.start + frac * (1.0 - self.start))
+        return True
+
+
 def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds=None,
                 resume=False, chunk_index=1, eval_every_steps=4_000_000,
                 ckpt_every_steps=3_000_000):
@@ -2127,6 +2186,9 @@ def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds
                                                  "select_metric": os.environ.get("SELECT_METRIC", "auto"),
                                                  "hedge_reward_scale": os.environ.get("HEDGE_REWARD_SCALE", "5.0"),
                                                  "hedge_spread_cost": os.environ.get("HEDGE_SPREAD_COST", "0"),
+                                                 "hedge_reward_clip": os.environ.get("HEDGE_REWARD_CLIP", "0"),
+                                                 "cost_ramp_steps": os.environ.get("COST_RAMP_STEPS", "0"),
+                                                 "cost_ramp_start": os.environ.get("COST_RAMP_START", "0.0"),
                                                  "n_train_envs": n_train_envs,
                                                  "vec_env": os.environ.get("VEC_ENV", "dummy"),
                                                  "torch_threads": torch.get_num_threads()})
@@ -2174,6 +2236,9 @@ def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds
     ]
     if deadline is not None:
         callbacks.append(TimeLimitCallback(deadline, verbose=1))
+    ramp_steps = int(float(os.environ.get("COST_RAMP_STEPS", "0")))
+    if ramp_steps > 0:
+        callbacks.append(CostCurriculumCallback(ramp_steps, float(os.environ.get("COST_RAMP_START", "0.0"))))
 
     t_learn = time.time()
     if remaining > 0:

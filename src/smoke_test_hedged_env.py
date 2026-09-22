@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from rl_trading_pipeline import (
-    HedgedPairEnv, process_day_cached, build_state_features, fit_feature_scaler,
+    HedgedPairEnv, MultiDayEnv, process_day_cached, build_state_features, fit_feature_scaler,
     apply_scaler, HEDGE_FACTOR, WIN_COST_PER_SIDE_BRL, BOVA_COST_PCT_PER_SIDE,
 )
 
@@ -168,6 +168,56 @@ def test_real_day():
     print("parte 2 (dia real): OK")
 
 
+def test_reward_clip():
+    """reward_clip limita o que o PPO vê (obs/step), mas NUNCA o P/L real
+    (total_reward) -- ver docs/relatorio_diagnostico_sintetico.md, §6.2."""
+    W = np.array([120000, 130000, 120000, 130000, 120000, 130000, 120000, 130000], float)  # saltos de 10.000 pts
+    B = np.full(8, 120.0)  # BOVA parado: sem hedge efetivo, MtM cru do WIN vira o reward
+    env = make_env(W, B, reward_scale=1.0, reward_clip=50.0)
+    env.reset()
+    rewards = []
+    for a in (1, 1, 1, 1, 1, 1, 1):
+        _, r, term, _, _ = env.step(a)
+        rewards.append(r)
+        if term:
+            break
+    assert all(abs(r) <= 50.0 + TOL for r in rewards), rewards
+    assert max(abs(r) for r in rewards) > 49.0, "o teste não estourou o clip; ajuste os saltos"
+    # sem clip, o MESMO cenário produz reward MUITO maior (0,2 R$/pt * 10.000 pts = 2.000)
+    env2 = make_env(W, B, reward_scale=1.0)
+    env2.reset()
+    r2 = [env2.step(a)[1] for a in (1, 1, 1, 1, 1, 1, 1)]
+    assert max(abs(x) for x in r2) > 1000
+    # o P/L REAL (total_reward) não muda com o clip: mesmas ações, mesmo resultado
+    assert abs(env.total_reward - env2.total_reward) < TOL, (env.total_reward, env2.total_reward)
+    # clip desligado por padrão (reward_clip=None) reproduz o comportamento antigo
+    env3 = make_env(W, B, reward_scale=1.0, reward_clip=None)
+    r3 = [env3.step(a)[1] for a in (1, 1, 1, 1, 1, 1, 1)]
+    assert r3 == r2
+    print("reward_clip: OK (limita o step(), preserva o P/L real)")
+
+
+def test_cost_curriculum():
+    """MultiDayEnv.set_cost_scale muda cost_scale em TODOS os day_envs (não só o
+    atual), pois o próximo reset pode sortear qualquer um -- ver CostCurriculumCallback."""
+    df = process_day_cached(1)
+    raw = build_state_features(df)
+    mean, std = fit_feature_scaler([raw])
+    feat = apply_scaler(raw, mean, std)
+    envs = [HedgedPairEnv(df, feat, transaction_fee=1.0) for _ in range(3)]
+    multi = MultiDayEnv(envs, seed=0)
+    assert all(e.cost_scale == 1.0 for e in envs)
+    multi.set_cost_scale(0.0)
+    assert all(e.cost_scale == 0.0 for e in envs), [e.cost_scale for e in envs]
+    multi.reset()
+    assert multi.current_env.cost_scale == 0.0
+    multi.set_cost_scale(0.37)
+    assert all(abs(e.cost_scale - 0.37) < TOL for e in envs)
+    print("cost curriculum (MultiDayEnv.set_cost_scale): OK")
+
+
 if __name__ == "__main__":
     test_synthetic()
     test_real_day()
+    test_reward_clip()
+    test_cost_curriculum()
