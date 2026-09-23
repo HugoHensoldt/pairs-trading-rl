@@ -11,6 +11,10 @@
 #   grid_wide  grade mais larga e mais densa (120 combinações), mesma rede.
 #   net_big    grade base, rede 2x LSTM(128) + dropout 0.2.
 #   seed2      repete o base com outra semente: mede o ruído entre execuções.
+# Variantes v3 (tiram o atalho "combinação -> taxa de lucro"; avaliar com src/analyze_lstm_variant.py):
+#   balnosl    cada combinação 50/50 no treino/validação (LSTM_COMBO_BALANCE=1) + sem SL/SG (LSTM_DROP_FEATURES).
+#   bal        só o balanceamento por combinação.      nosl   só sem SL/SG.
+#   balnosl_s2 repete balnosl com outra semente (ruído da variante).
 # A ORDEM é a de prioridade: se o tempo/fila acabar, o que ficou para trás é o
 # menos importante. Cada experimento é independente: se um falhar, a campanha
 # segue para o próximo.
@@ -35,6 +39,12 @@ EXPERIMENTS=(
     "grid_wide|LSTM_SIGMA_GRID=1.0,1.2,1.4,1.6,1.8,2.0 LSTM_RE_GRID=0.5,0.6,0.75,0.9 LSTM_RI_GRID=0.5,0.75,1.0,1.25,1.5"
     "net_big|LSTM_UNITS=128 LSTM_DROPOUT=0.2"
     "seed2|LSTM_SEED=2"
+    # --- variantes v3 (tirar o atalho "combinação -> taxa"; ver docs/lstm_leitura_v2.md e src/analyze_lstm_variant.py) ---
+    # A ordem é a de prioridade. Todas usam a grade padrão do código (sigma 2,2/2,4/2,6) e o mesmo split que a v2.
+    "balnosl|LSTM_COMBO_BALANCE=1 LSTM_DROP_FEATURES=SL,SG"        # 1+2: cada combinação 50/50 e sem SL/SG (recomendada)
+    "bal|LSTM_COMBO_BALANCE=1"                                      # só 1: cada combinação 50/50 (mantém SL/SG)
+    "nosl|LSTM_DROP_FEATURES=SL,SG"                                 # só 2: sem SL/SG (class_weight global, como na v2)
+    "balnosl_s2|LSTM_COMBO_BALANCE=1 LSTM_DROP_FEATURES=SL,SG LSTM_SEED=2"   # ruído entre sementes da variante 1+2
 )
 
 for exp in "${EXPERIMENTS[@]}"; do

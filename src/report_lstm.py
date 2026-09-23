@@ -554,7 +554,8 @@ def build_report(run_root, tag, out_dir, compare=False, n_boot=300, exclude=("ls
             ["Rede", f"2× LSTM({cfg['units']}) + Dense(1, sigmoid)" + (f", dropout {cfg['dropout']}" if cfg["dropout"] else "")],
             ["Treino", f"Adam, binary_crossentropy, batch {cfg['batch_size']}, até {cfg['max_epochs']} épocas, "
                        f"early stopping (paciência {cfg['patience']}, melhor val_loss); "
-                       + ("class_weight" if cfg.get("class_weight") else "oversampling" if cfg.get("oversampling") else "sem balanceamento")
+                       + ("class_weight POR COMBINAÇÃO (cada combinação 50/50 no treino e na validação)" if cfg.get("combo_balance")
+                          else "class_weight" if cfg.get("class_weight") else "oversampling" if cfg.get("oversampling") else "sem balanceamento")
                        + (f"; semente {cfg['seed']}" if cfg.get("seed") else "")],
             ["Validação", "TimeSeriesSplit expanding window sobre os pregões (split por dia); scaler e balanceamento ajustados só no treino do fold"],
         ], columns=["Item", "Valor"])), ""]

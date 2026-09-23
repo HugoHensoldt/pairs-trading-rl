@@ -297,6 +297,18 @@ CYCLICAL_COLS = ['day_sin', 'day_cos', 'time_sin', 'time_cos']
 FEATURE_COLS = BASE_FEATURE_COLS + CYCLICAL_COLS   # 11 features no total
 N_TICKS = 120  # janela de ticks anteriores à confirmação do sinal
 
+# [MUDANÇA 11] Ablação de features: LSTM_DROP_FEATURES="SL,SG" tira essas colunas da ENTRADA da
+# rede (o cache de amostras continua com as 14 colunas; a seleção é feita na leitura, em
+# load_samples). Motivo: SL = Ri*d e SG = Re*d, então a razão SL/SG = Ri/Re revela a combinação
+# (sigma, Re, Ri), e a taxa de lucro depende sobretudo de Ri -- a rede aprendia a taxa da
+# combinação em vez de ler o mercado (docs/lstm_leitura_base.md). Padrão: nada é removido.
+_DROP = [c.strip() for c in os.environ.get("LSTM_DROP_FEATURES", "").split(",") if c.strip()]
+_bad = [c for c in _DROP if c not in FEATURE_COLS]
+if _bad:
+    raise ValueError(f"LSTM_DROP_FEATURES com nomes desconhecidos: {_bad}; válidos: {FEATURE_COLS}")
+KEEP_NAMES = [c for c in FEATURE_COLS if c not in _DROP]     # ordem preservada (cíclicas no fim)
+KEEP_IDX = [FEATURE_COLS.index(c) for c in KEEP_NAMES] if _DROP else None
+
 
 def extract_trade_windows(df, n_ticks=N_TICKS, return_forced=False, return_pl=False):
     """Percorre o df de um dia e, a cada TRANSIÇÃO real de posição
@@ -587,14 +599,17 @@ def load_samples(orders, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400):
         def _read(path, side=side):
             with np.load(path) as z:
                 y = z[f'{side}_y']
-                return (z[f'{side}_X'], y) if len(y) else None
+                if not len(y):
+                    return None
+                X = z[f'{side}_X']
+                return (X[:, :, KEEP_IDX] if KEEP_IDX is not None else X, y)
         # leitura em threads (I/O + descompressão): milhares de .npz pequenos
         # levavam >10 min em série; map() preserva a ordem
         with ThreadPoolExecutor(max_workers=int(os.environ.get("LSTM_LOAD_THREADS", "12"))) as ex:
             parts = [p for p in ex.map(_read, files) if p is not None]
         Xs = [p[0] for p in parts]
         ys = [p[1] for p in parts]
-        X = np.concatenate(Xs) if Xs else _stack([])
+        X = np.concatenate(Xs) if Xs else np.empty((0, N_TICKS, len(KEEP_NAMES)), dtype=np.float32)
         y = np.concatenate(ys) if ys else np.empty((0,), dtype=np.float32)
         out[side] = (X, y)
     return out
@@ -605,17 +620,41 @@ def load_sample_meta(orders, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400):
     o pregão de origem e o índice da combinação (sigma, Re, Ri) na grade. Serve
     para o relatório quebrar as métricas por combinação e por dia."""
     out = {}
+    jobs = [(order, ci, _cache_file(order, *combo, Periodo, Amostra))
+            for order in orders for ci, combo in enumerate(param_grid)]
     for side in ('buy', 'sell'):
-        ords, combos = [], []
-        for order in orders:
-            for ci, combo in enumerate(param_grid):
-                with np.load(_cache_file(order, *combo, Periodo, Amostra)) as z:
-                    n = len(z[f'{side}_y'])
-                ords.append(np.full(n, order, dtype=np.int32))
-                combos.append(np.full(n, ci, dtype=np.int16))
+        def _len(job, side=side):
+            with np.load(job[2]) as z:
+                return len(z[f'{side}_y'])
+        with ThreadPoolExecutor(max_workers=int(os.environ.get("LSTM_LOAD_THREADS", "12"))) as ex:
+            lens = list(ex.map(_len, jobs))          # map() preserva a ordem
+        ords = [np.full(n, j[0], dtype=np.int32) for j, n in zip(jobs, lens)]
+        combos = [np.full(n, j[1], dtype=np.int16) for j, n in zip(jobs, lens)]
         out[side] = (np.concatenate(ords) if ords else np.empty(0, np.int32),
                      np.concatenate(combos) if combos else np.empty(0, np.int16))
     return out
+
+
+# [MUDANÇA 11] Balanceamento POR COMBINAÇÃO: pesos de amostra tais que, dentro de cada
+# combinação (sigma, Re, Ri), lucro e prejuízo pesem igual (50/50). O peso total de cada
+# combinação continua proporcional ao seu nº de amostras. Assim a taxa de lucro da combinação
+# deixa de ser aprendível (o melhor palpite constante passa a ser 0,5 em TODA combinação) e
+# sobra, como sinal, só o que distingue oportunidades DENTRO da combinação. Usado também na
+# validação, para o early stopping medir esse sinal e não o atalho.
+COMBO_BALANCE = os.environ.get("LSTM_COMBO_BALANCE", "0") not in ("", "0", "false", "False")
+
+
+def combo_balance_weights(y, combo):
+    y = np.asarray(y, dtype=np.float32)
+    w = np.ones(len(y), dtype=np.float32)
+    for c in np.unique(combo):
+        m = combo == c
+        n1 = float(y[m].sum())
+        n0 = float(m.sum()) - n1
+        if n1 > 0 and n0 > 0:
+            w[m & (y > 0.5)] = m.sum() / (2.0 * n1)
+            w[m & (y <= 0.5)] = m.sum() / (2.0 * n0)
+    return w * (len(w) / w.sum())                   # média 1
 
 
 def label_balance_report(orders, param_grid=PARAM_GRID, Periodo=3000, Amostra=2400,
@@ -679,7 +718,8 @@ def scale_datasets(splits):
         return {'train': (X_train, y_train), 'val': (X_val, y_val),
                 'test': (X_test, y_test), 'scaler': None}
 
-    n_scale = len(BASE_FEATURE_COLS)
+    # colunas base mantidas (as cíclicas ficam sempre no fim e sem normalizar)
+    n_scale = sum(1 for c in KEEP_NAMES if c in BASE_FEATURE_COLS)
 
     scaler = StandardScaler()
     scaler.fit(X_train[:, :, :n_scale].reshape(-1, n_scale))
@@ -1094,7 +1134,7 @@ def train_task(fold, side, param_grid=PARAM_GRID, batch_size=256, max_epochs=50,
     import hashlib
     cache_key = hashlib.md5(repr((
         [int(o) for o in tr_orders], [int(o) for o in va_orders], [int(o) for o in test_orders],
-        [tuple(map(float, c)) for c in param_grid], side, N_TICKS, list(FEATURE_COLS))).encode()).hexdigest()
+        [tuple(map(float, c)) for c in param_grid], side, N_TICKS, list(KEEP_NAMES))).encode()).hexdigest()
     scaled_path = tdir / "scaled_data.npz"
     scaled = None
     if scaled_path.exists():
@@ -1139,7 +1179,21 @@ def train_task(fold, side, param_grid=PARAM_GRID, batch_size=256, max_epochs=50,
         return state
 
     class_weight = None
-    if use_oversampling:
+    sw_train = sw_val = combo_rate_train = None
+    if COMBO_BALANCE:
+        # [MUDANÇA 11] cada combinação 50/50 (treino e validação); substitui class_weight/oversampling
+        c_tr = load_sample_meta(tr_orders, param_grid)[side][1]
+        c_va = load_sample_meta(va_orders, param_grid)[side][1]
+        if len(c_tr) != len(y_train) or len(c_va) != len(y_val):
+            raise RuntimeError("meta das combinações desalinhada dos dados normalizados")
+        sw_train, sw_val = combo_balance_weights(y_train, c_tr), combo_balance_weights(y_val, c_va)
+        combo_rate_train = np.full(len(param_grid), np.nan, dtype=np.float32)
+        for ci in np.unique(c_tr):
+            combo_rate_train[ci] = float(y_train[c_tr == ci].mean())
+        print(f"[fold{fold} {side}] balanceamento por combinação: {len(np.unique(c_tr))} combinações; "
+              f"taxa de lucro no treino por combinação: {np.nanmin(combo_rate_train):.2f}-{np.nanmax(combo_rate_train):.2f} "
+              f"(pesos 50/50)", flush=True)
+    elif use_oversampling:
         X_train, y_train = oversample_minority(X_train, y_train)   # seed fixa -> mesmo em todo pedaço
     else:
         n_pos = float(y_train.sum())
@@ -1158,9 +1212,10 @@ def train_task(fold, side, param_grid=PARAM_GRID, batch_size=256, max_epochs=50,
         state['done'] = True
     if not state['done']:
         deadline = SCRIPT_START + max_seconds - 60 if max_seconds else 0  # 60s p/ avaliação final
-        model.fit(X_train, y_train, validation_data=(X_val, y_val),
+        model.fit(X_train, y_train,
+                  validation_data=(X_val, y_val) if sw_val is None else (X_val, y_val, sw_val),
                   epochs=max_epochs, initial_epoch=state['epochs_done'],
-                  batch_size=batch_size, class_weight=class_weight,
+                  batch_size=batch_size, class_weight=class_weight, sample_weight=sw_train,
                   callbacks=[_make_checkpoint_callback(tdir, state, patience, max_epochs, deadline)],
                   verbose=2)
     _write_json_atomic(tdir / "state.json", state)
@@ -1190,13 +1245,15 @@ def train_task(fold, side, param_grid=PARAM_GRID, batch_size=256, max_epochs=50,
         y_val=y_val, p_val=p_val, order_val=meta_val[0], combo_val=meta_val[1],
         y_test=y_test, p_test=p_test, order_test=meta_test[0], combo_test=meta_test[1],
         y_train=y_train[tr_idx], p_train=p_train,
-        grid=np.asarray(param_grid, dtype=float))
+        grid=np.asarray(param_grid, dtype=float),
+        **({'combo_rate_train': combo_rate_train} if combo_rate_train is not None else {}))
     metrics = {'fold': fold, 'side': side, 'epochs': state['epochs_done'],
                'best_val_loss': state['best_val_loss'], 'n_train': int(len(y_train)),
                'val': _metrics_from_prob(y_val, p_val),
                'test': _metrics_from_prob(y_test, p_test),
                'config': {'tag': RUN_TAG, 'grid': [list(map(float, c)) for c in param_grid],
-                          'features': FEATURE_COLS, 'n_ticks': N_TICKS,
+                          'features': KEEP_NAMES, 'n_ticks': N_TICKS,
+                          'combo_balance': bool(COMBO_BALANCE), 'drop_features': _DROP,
                           'units': LSTM_UNITS, 'dropout': LSTM_DROPOUT,
                           'batch_size': batch_size, 'max_epochs': max_epochs, 'patience': patience,
                           'class_weight': (class_weight is not None), 'oversampling': use_oversampling,
