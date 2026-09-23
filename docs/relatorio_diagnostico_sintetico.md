@@ -167,9 +167,49 @@ Decorrem diretamente do mecanismo identificado (§0.4, §3):
 
 ---
 
+## 7. Atualização (23/09/2026): as correções pontuais não resolveram e a bissecção aponta para a receita de treino
+
+### 7.1 Rodada de validação das correções (`syn_coint_fix_{entcoef,costramp,combo}_s0`)
+O agente do SDumont relatou que **nenhuma das três variantes capturou a regra ótima** (os arquivos completos ficaram no cluster; só o resumo veio para cá, então não há tabela própria). Duas ressalvas minhas sobre o que essa rodada realmente testou:
+
+- **O `reward_clip=50` quase nunca atuou.** Uma transação custa R$ 5,77, que o PPO vê como 28,9 (recompensa ×5), abaixo do clipe; só uma virada de posição (57,7) o ultrapassa. Portanto "agente sensível a outliers de recompensa" **não foi testado**; `costramp` e `combo` testaram, na prática, a curva de custo (e, no `combo`, `ent_coef` = 0,05).
+- **Erro de memória meu, corrigido em `4ea6be0`.** Ao adicionar o `bench` aos ambientes, `self.bench` passou a referenciar a matriz de features float64 original (além da cópia float32), e cada um dos 48 ambientes guardava a sua. No estado raw isso multiplicou a memória por ~2,3× (48 ambientes × 8 dias: de ~2,3 GB para 0 MB de excesso depois da correção, que compartilha uma matriz float32 por dia). Não altera resultados (observações idênticas, testado), mas inflou o uso de memória das rodadas raw no cluster.
+
+### 7.2 A informação do spread está acessível no estado "só preços"
+`src/probe_raw_information.py` regride o spread verdadeiro X_t nas features raw (40 dias de treino, 10 de validação, sem RL):
+
+| Features | R² (X_t), OLS | R² (X_t), gradient boosting | R² (X(t+300)−X(t)), OLS |
+|---|---|---|---|
+| raw **com** os 4 níveis de preço | **−1,23** | +0,41 | −2,97 |
+| raw **sem** os níveis | **+0,52** | +0,40 | +0,13 |
+
+- A razão log(WIN/BOVA11) varia ~320 pts **entre dias** (deriva e rollover) contra ~42 pts **dentro do dia**; os níveis viram identificador de dia e fazem o modelo linear extrapolar mal.
+- O sinal está na **diferença** entre os retornos dos dois ativos: `ret1000_win − ret1000_bova` tem correlação **0,68** com o spread, contra 0,18 do retorno do WIN sozinho.
+- A relação sinal/ruído por tick é baixa: retorno esperado da reversão ≈ 0,037 R$/tick contra desvio de 0,54 R$/tick (razão ≈ 0,07).
+
+### 7.3 Bissecção: o agente falha até quando recebe o spread verdadeiro
+Treinos locais de 6M timesteps (61 atualizações de PPO, mesmos hiperparâmetros do baseline, 40 dias sintéticos, custo cheio), variando só o estado (`STATE_KIND`):
+
+| Execução | Estado do agente | Val: negócios/dia | Val: % do tempo flat | Val: P/L (4 dias) | Entropia < 0,01 em |
+|---|---|---|---|---|---|
+| `oracle_c1` | **só o spread verdadeiro** (+ posição e P/L) | 1,0 | **0%** | −59,7 R$ (idêntico nos 4 checkpoints) | atualização 22 (2,2M) |
+| `raw_nolevels_c1` | raw sem níveis de preço | 2,25 → 1,0 | 45% → **0%** | −139,5 → −26,3 R$ | atualização ~27 (2,7M) |
+| `syn_coint_s0` (baseline, 60M) | raw com níveis | 0,07 | ~99,7% flat | +12,1 R$ (30 dias) | atualização 35 (3,4M) |
+
+- **No `oracle_c1` o agente tem em mãos exatamente a variável que a regra ótima usa e mesmo assim não aprende a regra.** A política converge para "abrir uma posição no início e segurá-la o dia todo" (1,0 negócio/dia, nunca flat, nenhum acerto), com P/L de validação **constante** em −59,7 R$ nos 4 checkpoints, isto é, **ignora a observação**. O `raw_nolevels_c1` termina no mesmo comportamento.
+- **A representação não é o gargalo principal.** Se fosse, o `oracle_c1` aprenderia. O que se repete nos três casos é o colapso de entropia muito cedo (2–3M de 6–60M timesteps), agora para uma **ação constante** (flat no baseline, posição fixa nestes dois), e depois disso o PPO fica congelado (entropia ~4e-5, `approx_kl` ≈ 0 ao final).
+- **O gatilho continua o mesmo:** a política aleatória do início troca de ação em ~2/3 dos ticks, gerando milhares de negócios por episódio (recompensa de episódio de −300 mil a −440 mil R$ ×5 nos primeiros rollouts). Com exploração sem nenhuma persistência temporal, o caminho de menor custo é parar de trocar de ação, e qualquer ação constante serve.
+
+### 7.4 Hipóteses estruturais a testar (nenhuma executada ainda)
+1. **Exploração persistente:** repetir a ação escolhida por k ticks (*frame skip*, k≈20–100) ou usar ações "pegajosas". Reduz o custo esperado da política aleatória em ~k vezes, encurta o horizonte de 27.000 para ~500 decisões por episódio e aumenta a razão sinal/ruído por decisão. É o ataque mais direto ao gatilho identificado.
+2. **Escala do valor:** o *value loss* inicial é ~2,3e5 e o clipe global de gradiente (0,5) é compartilhado entre política e crítico; testar `HEDGE_REWARD_SCALE` bem menor (ex.: 0,05) ou `VecNormalize`.
+3. **GAE/horizonte:** com λ = 0,95 o crédito de uma entrada a centenas de ticks do ganho depende quase só do crítico; testar λ ≈ 0,999.
+4. **Passo de otimização:** 10 épocas × 24 minibatches = 240 passos de gradiente por atualização com lr 3e-4; testar menos épocas / lr menor para o crítico visitar estados com posição antes da política congelar.
+5. **Aquecimento:** iniciar a política numa regra que já opera na região certa (evita o atrator de ação constante por construção).
+
 ## Apêndice: arquivos e reprodução
 
 - **Resultados brutos:** `sdumont_backup_sintetico/` (`sintetico_progresso.md` com o log completo da campanha; `pairs-trading-rl/src/runs/syn_{coint,null}_s0/fold1/` com `state.json`, `val_curve.csv`, `logs/chunk*/progress.csv`, `eval/*`, `diag/*`).
 - **Figuras:** `python src/analyze_synthetic.py` (no WSL/venv com matplotlib).
 - **Como foi gerado:** `slurm/submit_synthetic.sh` (driver autônomo) + `slurm/submit_diag.sbatch`; código em `src/synthetic_pair.py`, `src/synthetic_benchmark.py`, `src/diagnose_agent.py`, `src/rl_trading_pipeline.py` (`build_raw_features`, `STATE_KIND=raw`).
-- **Branch/commit:** `estado-simplificado-v4`, commit `ba3c7f5` (código que gerou esta rodada).
+- **Branch/commit:** `estado-simplificado-v4`, commit `ba3c7f5` (código que gerou o baseline); `4ea6be0` (correção de memória, modo `oracle` e `probe_raw_information.py`, usados na §7).
