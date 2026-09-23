@@ -404,17 +404,35 @@ def build_raw_features(df, levels=None, doy=None):
 
 
 def state_kind():
-    """'spread' (padrão: os 2 spreads contra o preço justo, v4) ou 'raw' (só preços)."""
+    """'spread' (padrão: os 2 spreads contra o preço justo, v4), 'raw' (só preços) ou
+    'oracle' (SÓ SINTÉTICO, diagnóstico de bissecção: a única feature é o spread
+    verdadeiro `true_x`; testa se o PPO aprende a regra quando o sinal é entregue)."""
     return os.environ.get("STATE_KIND", "spread")
+
+
+def build_oracle_features(df):
+    """Feature ÚNICA = spread verdadeiro / desvio (só existe nos dados sintéticos)."""
+    assert "true_x" in df.columns, "STATE_KIND=oracle exige dados sintéticos (SYNTHETIC=coint)"
+    return (df["true_x"].to_numpy(dtype=float) / float(os.environ.get("SYNTH_SPREAD_STD", "40")))[:, None]
 
 
 def build_features(df):
     """Features de mercado do estado conforme STATE_KIND."""
-    return build_raw_features(df) if state_kind() == "raw" else build_state_features(df)
+    kind = state_kind()
+    if kind == "raw":
+        return build_raw_features(df)
+    if kind == "oracle":
+        return build_oracle_features(df)
+    return build_state_features(df)
 
 
 def state_feature_names():
-    return raw_feature_names() if state_kind() == "raw" else list(STATE_FEATURE_NAMES)
+    kind = state_kind()
+    if kind == "raw":
+        return raw_feature_names()
+    if kind == "oracle":
+        return ["spread_verdadeiro_padronizado"]
+    return list(STATE_FEATURE_NAMES)
 
 
 def build_bench_features(df):
@@ -504,10 +522,12 @@ class ArbitrageTradingEnv(gym.Env):
         # lento que indexação numpy direta.
         self.bid = df['bid'].to_numpy(dtype=float)
         self.ask = df['ask'].to_numpy(dtype=float)
-        self.feature_matrix = feature_matrix.astype(np.float32)
+        # np.asarray (não .astype): se já é float32 NÃO copia, e assim os ~48 envs de um
+        # processo compartilham UMA matriz por dia (ver _scaled_features_cached)
+        self.feature_matrix = np.asarray(feature_matrix, dtype=np.float32)
         # bench: 2 colunas que rotulam os negócios em `trade_details` (por padrão as 2
         # primeiras colunas do estado; no modo raw vêm de build_bench_features)
-        self.bench = feature_matrix if bench is None else bench
+        self.bench = self.feature_matrix if bench is None else bench
         self.transaction_fee = transaction_fee
         self.reward_scale = reward_scale
         # stop-loss por posição: regra FIXA (não aprendida), desligada por
@@ -799,10 +819,12 @@ class HedgedPairEnv(gym.Env):
         self.bova_ask = df['bask'].to_numpy(dtype=float)
         # mids calculados sob demanda (_wm/_bm): com dezenas de envs x centenas
         # de dias por processo, arrays de mid extras custariam GBs
-        self.feature_matrix = feature_matrix.astype(np.float32)
+        # np.asarray (não .astype): se já é float32 NÃO copia, e assim os ~48 envs de um
+        # processo compartilham UMA matriz por dia (ver _scaled_features_cached)
+        self.feature_matrix = np.asarray(feature_matrix, dtype=np.float32)
         # bench: 2 colunas que rotulam os negócios em `trade_details` (por padrão as 2
         # primeiras colunas do estado; no modo raw vêm de build_bench_features)
-        self.bench = feature_matrix if bench is None else bench
+        self.bench = self.feature_matrix if bench is None else bench
         self.n_features = feature_matrix.shape[1]
         if self.track_details:
             self.mid = (self.win_bid + self.win_ask) / 2
@@ -1029,10 +1051,12 @@ class SpreadRewardEnv(gym.Env):
         self.bova_ask = df['bask'].to_numpy(dtype=float)
         self.wbj = df['Wbjusto'].to_numpy(dtype=float)
         self.waj = df['Wajusto'].to_numpy(dtype=float)
-        self.feature_matrix = feature_matrix.astype(np.float32)
+        # np.asarray (não .astype): se já é float32 NÃO copia, e assim os ~48 envs de um
+        # processo compartilham UMA matriz por dia (ver _scaled_features_cached)
+        self.feature_matrix = np.asarray(feature_matrix, dtype=np.float32)
         # bench: 2 colunas que rotulam os negócios em `trade_details` (por padrão as 2
         # primeiras colunas do estado; no modo raw vêm de build_bench_features)
-        self.bench = feature_matrix if bench is None else bench
+        self.bench = self.feature_matrix if bench is None else bench
         self.n_features = feature_matrix.shape[1]
         if self.track_details:
             self.mid = (self.win_bid + self.win_ask) / 2
@@ -1278,6 +1302,25 @@ class MultiDayEnv(gym.Env):
                 e.cost_scale = value
 
 
+_FEAT_CACHE = {}
+
+
+def _scaled_features_cached(order, df, mean, std):
+    """Features padronizadas (float32) de um pregão, compartilhadas entre TODOS os
+    ambientes do processo. Antes cada um dos ~48 envs de um DummyVecEnv guardava
+    a sua própria cópia da mesma matriz (e, com o estado raw de 20 colunas,
+    isso passava de 60 GB em 300 dias x 48 envs). Chave: pregão + tipo de estado
+    + impressão digital do scaler."""
+    key = (order, state_kind(), os.environ.get("RAW_LEVELS", "1"), os.environ.get("RAW_DOY", "0"),
+           hash(mean.tobytes()), hash(std.tobytes()))
+    f = _FEAT_CACHE.get(key)
+    if f is None:
+        f = np.ascontiguousarray(apply_scaler(build_features(df), mean, std), dtype=np.float32)
+        f.setflags(write=False)               # compartilhada: somente leitura
+        _FEAT_CACHE[key] = f
+    return f
+
+
 def build_day_envs(orders, mean, std, transaction_fee=2.5,
                     max_loss_per_position=None):
     """Carrega e processa cada pregão em `orders` UMA VEZ, retornando uma
@@ -1290,8 +1333,7 @@ def build_day_envs(orders, mean, std, transaction_fee=2.5,
     envs = []
     for order in orders:
         df = process_day_cached(order)
-        feat = build_features(df)
-        feat = apply_scaler(feat, mean, std)
+        feat = _scaled_features_cached(order, df, mean, std)
         envs.append(_env_class()(df, feat,
                                          transaction_fee=transaction_fee,
                                          max_loss_per_position=max_loss_per_position))
@@ -1627,7 +1669,7 @@ def _run_day(order, spec, model, mean, std, fee, record_equity, latency=0):
 
     df = process_day_cached(order)
     feat = apply_scaler(build_features(df), mean, std)
-    bench = build_bench_features(df) if state_kind() == "raw" else None
+    bench = build_bench_features(df) if state_kind() in ("raw", "oracle") else None
     env = _env_class()(df, feat, transaction_fee=fee, record_equity=record_equity,
                        track_details=True, bench=bench)
     policy = _make_policy(spec, model, order)
@@ -2324,7 +2366,7 @@ def _eval_part1(models, ref_name, sets, mean, std, fee, out_dir, has_time, recor
     # a regra de limiar lê os spreads do estado; no modo raw eles não existem (a
     # comparação com regras clássicas está em diagnose_agent.py)
     baselines = [("flat", ("flat",))]
-    if state_kind() != "raw":
+    if state_kind() == "spread":
         baselines.append(("threshold1.0", ("threshold", 1.0)))
     baselines.append(("random", ("random", 0)))
     for bname, spec in baselines:

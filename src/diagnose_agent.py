@@ -360,7 +360,7 @@ def worker_placebo(args):
     other = P.process_day_cached(other_order) if kind == "bova_other_day" else None
     d_obs = perturb(df, kind, other)
     feat = P.apply_scaler(P.build_features(d_obs), _G["mean"], _G["std"])
-    bench = P.build_bench_features(df) if P.state_kind() == "raw" else None
+    bench = P.build_bench_features(df) if P.state_kind() in ("raw", "oracle") else None
     env = P._env_class()(df, feat, transaction_fee=_G["fee"], track_details=(kind == "original"), bench=bench)
     model = _G["model"]
     obs, _ = env.reset()
