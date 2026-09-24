@@ -791,7 +791,7 @@ class HedgedPairEnv(gym.Env):
 
     def __init__(self, df, feature_matrix, transaction_fee=1.0, reward_scale=None,
                  max_loss_per_position=None, record_equity=False, track_details=False,
-                 include_spread_cost=None, bench=None, reward_clip=None):
+                 include_spread_cost=None, bench=None, reward_clip=None, shaping_z=None):
         super().__init__()
         assert len(df) == len(feature_matrix)
         self.n_day_ticks = len(df)
@@ -810,6 +810,19 @@ class HedgedPairEnv(gym.Env):
         # vantagem do PPO. None/0 (default) preserva o comportamento anterior.
         rc = os.environ.get("HEDGE_REWARD_CLIP", "0") if reward_clip is None else reward_clip
         self.reward_clip = float(rc) if float(rc) > 0 else None
+        # SHAPING (ver docs/relatorio_diagnostico_sintetico.md, §7): termo extra somado à
+        # recompensa que o PPO vê, em R$ por tick (antes de reward_scale). NUNCA entra em
+        # `total_reward` (P/L real reportado). Só age se `shaping_z` (sinal z por tick,
+        # POSITIVO = WIN caro em relação ao BOVA11) foi passado, isto é, só nos ambientes de
+        # TREINO criados por build_day_envs. SHAPING_KIND: none | opp_flat | opp_wrong |
+        # pbrs | regret. Ver _shaping().
+        self.shaping_z = shaping_z
+        self.shaping_kind = os.environ.get("SHAPING_KIND", "none") if shaping_z is not None else "none"
+        self.shaping_k = float(os.environ.get("SHAPING_K", "2.0"))        # limiar do sinal (em desvios)
+        self.shaping_k0 = float(os.environ.get("SHAPING_K0", "0.25"))     # "sem sinal" (opp_wrong)
+        self.shaping_lambda = float(os.environ.get("SHAPING_LAMBDA", "0.05"))  # R$/tick por unidade de z
+        self.shaping_c = float(os.environ.get("SHAPING_C", "5.0"))        # R$ por desvio (pbrs)
+        self.shaping_gamma = float(os.environ.get("GAMMA", "0.999999"))   # mesmo gamma do PPO
         self.include_spread_cost = ((os.environ.get("HEDGE_SPREAD_COST", "0") == "1")
                                     if include_spread_cost is None else include_spread_cost)
         # arrays numpy (sem guardar o DataFrame; ver ArbitrageTradingEnv)
@@ -837,6 +850,8 @@ class HedgedPairEnv(gym.Env):
         self._reset_state()
 
     def _reset_state(self):
+        self._phi_prev = 0.0               # potencial do estado atual (pbrs); flat no início => 0
+        self.total_shaping = 0.0           # soma do shaping no episódio (diagnóstico)
         self.t = 0
         self.position = 0                  # -1, 0, +1
         self.n_bova = 0.0                  # ações de BOVA11 da posição aberta (fixo)
@@ -931,9 +946,57 @@ class HedgedPairEnv(gym.Env):
         self._open_tick = t
         return cost
 
+    def _shaping(self, t, pos_before, pos_after, terminated):
+        """Termo de shaping (R$) do tick t. z = shaping_z: POSITIVO = WIN caro, então a
+        posição CERTA é vendida no par (-1) quando z > 0 e comprada (+1) quando z < 0;
+        alinhamento s = -posição * z (positivo = lado certo da convergência).
+
+          opp_flat : flat com |z| > k         -> -lambda * (|z| - k)
+          opp_wrong: flat com |z| > k          -> -lambda * (|z| - k)   (igual ao opp_flat)
+                     posição no lado ERRADO    -> -lambda * (|z| + k)
+                     lado certo e |z| < k0     -> -lambda * (k0 - |z|)  (sinal já convergiu)
+          pbrs     : F = gamma * Phi(s') - Phi(s), Phi = c * posição * (-z), Phi(terminal) = 0
+                     (Ng et al., 1999: preserva a política ótima)
+          regret   : -lambda * max(0, (ideal - posição_antes) * dpar), ideal = -sign(z[t-1])
+                     se |z[t-1]| > k, senão 0; dpar = P/L de 1 par comprado no tick t (R$)
+        """
+        kind, z = self.shaping_kind, self.shaping_z
+        k, lam = self.shaping_k, self.shaping_lambda
+        if kind == "none":
+            return 0.0
+        if kind in ("opp_flat", "opp_wrong"):
+            zt = float(z[t])
+            az = abs(zt)
+            if pos_after == 0:
+                return -lam * max(0.0, az - k)
+            if kind == "opp_flat":
+                return 0.0
+            align = -pos_after * zt
+            if align < 0:
+                return -lam * (az + k)
+            if az < self.shaping_k0:
+                return -lam * (self.shaping_k0 - az)
+            return 0.0
+        if kind == "pbrs":
+            phi_new = 0.0 if terminated else self.shaping_c * pos_after * (-float(z[self.t]))
+            f = self.shaping_gamma * phi_new - self._phi_prev
+            self._phi_prev = phi_new
+            return f
+        if kind == "regret":
+            if t == 0:
+                return 0.0
+            zp = float(z[t - 1])
+            ideal = (-1.0 if zp > 0 else 1.0) if abs(zp) > k else 0.0
+            w1, w0 = self._wm(t), self._wm(t - 1)
+            b1, b0 = self._bm(t), self._bm(t - 1)
+            dpar = (w1 - w0) * POINT_VALUE_BRL - (w1 / (HEDGE_FACTOR * b1)) * (b1 - b0)
+            return -lam * max(0.0, (ideal - pos_before) * dpar)
+        raise ValueError(f"SHAPING_KIND desconhecido: {kind!r}")
+
     def step(self, action):
         target = {0: 0, 1: 1, 2: -1}[int(action)]
         t = self.t
+        pos_before = self.position
         reward = 0.0
 
         # 1) MtM do par já aberto ANTES desta ação, do tick anterior até agora
@@ -954,6 +1017,7 @@ class HedgedPairEnv(gym.Env):
                 reward -= self._close_pair(t)
             if target != 0:
                 reward -= self._open_pair(target, t)
+        pos_after = self.position
 
         if self.position == 1:
             self.ticks_long += 1
@@ -969,6 +1033,10 @@ class HedgedPairEnv(gym.Env):
             reward -= self._close_pair(self.t)
 
         self.total_reward += reward
+        shape = 0.0
+        if self.shaping_z is not None and self.shaping_kind != "none":
+            shape = self._shaping(t, pos_before, pos_after, terminated)
+            self.total_shaping += shape
         if self.equity is not None:
             self.equity.append(self.total_reward)
 
@@ -976,8 +1044,9 @@ class HedgedPairEnv(gym.Env):
             self.observation_space.shape, dtype=np.float32)
         info = {"n_trades_closed": self.n_trades_closed,
                 "n_trades_won": self.n_trades_won,
-                "n_stop_loss_triggers": 0}
-        reward_out = reward * self.reward_scale
+                "n_stop_loss_triggers": 0,
+                "shaping_total": self.total_shaping}
+        reward_out = (reward + shape) * self.reward_scale
         if self.reward_clip is not None:
             reward_out = float(np.clip(reward_out, -self.reward_clip, self.reward_clip))
         return obs, reward_out, terminated, truncated, info
@@ -1321,6 +1390,34 @@ def _scaled_features_cached(order, df, mean, std):
     return f
 
 
+_SHAPE_CACHE = {}
+
+
+def _shaping_signal_cached(order, df, feat):
+    """Sinal z do shaping (POSITIVO = WIN caro), float32 somente leitura, compartilhado
+    entre os envs do processo. SHAPING_SIGNAL: 'features' (padrão no estado spread: média
+    das 2 features z-score, spread_compra e spread_venda) ou 'truth' (só sintético: spread
+    verdadeiro / desvio; informação PRIVILEGIADA usada só como professor no treino)."""
+    if os.environ.get("SHAPING_KIND", "none") == "none" or _env_class() is not HedgedPairEnv:
+        return None
+    sig = os.environ.get("SHAPING_SIGNAL", "features" if state_kind() == "spread" else "truth")
+    key = (order, sig, id(feat))
+    z = _SHAPE_CACHE.get(key)
+    if z is None:
+        if sig == "features":
+            assert state_kind() == "spread", "SHAPING_SIGNAL=features exige STATE_KIND=spread"
+            z = 0.5 * (feat[:, 0].astype(np.float64) + feat[:, 1].astype(np.float64))
+        elif sig == "truth":
+            assert "true_x" in df.columns, "SHAPING_SIGNAL=truth exige dados sintéticos"
+            z = df["true_x"].to_numpy(dtype=float) / float(os.environ.get("SYNTH_SPREAD_STD", "40"))
+        else:
+            raise ValueError(f"SHAPING_SIGNAL desconhecido: {sig!r}")
+        z = np.ascontiguousarray(z, dtype=np.float32)
+        z.setflags(write=False)
+        _SHAPE_CACHE[key] = z
+    return z
+
+
 def build_day_envs(orders, mean, std, transaction_fee=2.5,
                     max_loss_per_position=None):
     """Carrega e processa cada pregão em `orders` UMA VEZ, retornando uma
@@ -1334,9 +1431,11 @@ def build_day_envs(orders, mean, std, transaction_fee=2.5,
     for order in orders:
         df = process_day_cached(order)
         feat = _scaled_features_cached(order, df, mean, std)
+        z = _shaping_signal_cached(order, df, feat)
+        extra = {"shaping_z": z} if z is not None else {}
         envs.append(_env_class()(df, feat,
                                          transaction_fee=transaction_fee,
-                                         max_loss_per_position=max_loss_per_position))
+                                         max_loss_per_position=max_loss_per_position, **extra))
     return envs
 
 
@@ -2146,16 +2245,20 @@ class TradeStatsCallback(BaseCallback):
 
     def __init__(self):
         super().__init__(0)
-        self._trades, self._wins = [], []
+        self._trades, self._wins, self._shape = [], [], []
 
     def _on_step(self):
         for done, info in zip(self.locals["dones"], self.locals["infos"]):
             if done:
                 self._trades.append(info.get("n_trades_closed", 0))
                 self._wins.append(info.get("n_trades_won", 0))
+                self._shape.append(info.get("shaping_total", 0.0))
         return True
 
     def _on_rollout_end(self):
+        if self._shape:
+            self.logger.record("train/shaping_per_episode", float(np.mean(self._shape)))
+            self._shape = []
         if self._trades:
             self.logger.record("train/trades_per_episode", float(np.mean(self._trades)))
             self.logger.record("train/win_rate_episode",
@@ -2229,6 +2332,9 @@ def train_chunk(fold, run_dir, hparams, seed=0, transaction_fee=2.5, max_seconds
                                                  "hedge_reward_scale": os.environ.get("HEDGE_REWARD_SCALE", "5.0"),
                                                  "hedge_spread_cost": os.environ.get("HEDGE_SPREAD_COST", "0"),
                                                  "hedge_reward_clip": os.environ.get("HEDGE_REWARD_CLIP", "0"),
+                                                 "shaping": {k: os.environ.get(k) for k in (
+                                                     "SHAPING_KIND", "SHAPING_SIGNAL", "SHAPING_K", "SHAPING_K0",
+                                                     "SHAPING_LAMBDA", "SHAPING_C", "GAMMA", "HEDGE_REWARD_SCALE")},
                                                  "cost_ramp_steps": os.environ.get("COST_RAMP_STEPS", "0"),
                                                  "cost_ramp_start": os.environ.get("COST_RAMP_START", "0.0"),
                                                  "n_train_envs": n_train_envs,

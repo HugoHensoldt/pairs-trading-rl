@@ -216,8 +216,143 @@ def test_cost_curriculum():
     print("cost curriculum (MultiDayEnv.set_cost_scale): OK")
 
 
+def _shape_env(kind, z, W=None, B=None, **env):
+    """HedgedPairEnv com shaping (shaping_z = z) e parâmetros fixos para os testes."""
+    import os
+    n = len(z)
+    W = np.full(n, 120000.0) if W is None else np.asarray(W, float)
+    B = np.full(n, 120.0) if B is None else np.asarray(B, float)
+    old = {k: os.environ.get(k) for k in ("SHAPING_KIND", "SHAPING_K", "SHAPING_K0", "SHAPING_LAMBDA",
+                                          "SHAPING_C", "GAMMA")}
+    os.environ.update(SHAPING_KIND=kind, SHAPING_K="2.0", SHAPING_K0="0.25", SHAPING_LAMBDA="0.05",
+                      SHAPING_C="5.0", GAMMA=env.pop("gamma", "1.0"))
+    try:
+        df = pd.DataFrame({"bid": W, "ask": W, "bbid": B, "bask": B, "Wajusto": W, "Wbjusto": W}).astype(float)
+        return HedgedPairEnv(df, np.zeros((n, 2)), reward_scale=1.0, shaping_z=np.asarray(z, np.float32), **env)
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _rewards(env, acts):
+    env.reset()
+    out = []
+    for a in acts:
+        _, r, term, _, _ = env.step(a)
+        out.append(r)
+        if term:
+            break
+    return np.array(out)
+
+
+def test_shaping():
+    """Shaping: soma um termo (R$/tick) ao que o PPO vê e NUNCA altera o P/L real."""
+    lam, k, k0, c = 0.05, 2.0, 0.25, 5.0
+    n = 12
+    # convenção: z > 0 = WIN caro => posição certa é VENDIDA (ação 2); z < 0 => COMPRADA (ação 1)
+
+    # none / sem shaping_z: idêntico ao ambiente antigo
+    z = np.full(n, 3.0)
+    base = _rewards(_shape_env("none", z), [0] * 6)
+    assert np.allclose(base, 0.0)
+
+    # opp_flat: flat com |z|=3 > k=2 => -lam*(3-2) por tick; flat com |z|=1 => 0
+    r = _rewards(_shape_env("opp_flat", np.full(n, 3.0)), [0] * 5)
+    assert np.allclose(r, -lam * 1.0), r
+    r = _rewards(_shape_env("opp_flat", np.full(n, 1.0)), [0] * 5)
+    assert np.allclose(r, 0.0), r
+    # opp_flat NÃO penaliza estar posicionado (nem no lado errado)
+    r = _rewards(_shape_env("opp_flat", np.full(n, 3.0)), [1, 1, 1])
+    assert r[1] == 0.0 and r[2] == 0.0
+
+    # opp_wrong: mesmo caso flat; lado ERRADO (comprado com z=+3) => -lam*(|z|+k) = -0,25
+    r = _rewards(_shape_env("opp_wrong", np.full(n, 3.0)), [0] * 3)
+    assert np.allclose(r, -lam * 1.0)
+    r = _rewards(_shape_env("opp_wrong", np.full(n, 3.0)), [1, 1, 1])      # comprado com WIN caro
+    assert abs(r[1] - (-lam * (3.0 + k))) < 1e-9, r
+    r = _rewards(_shape_env("opp_wrong", np.full(n, 3.0)), [2, 2, 2])      # vendido com WIN caro: certo
+    assert abs(r[1]) < 1e-9, r
+    r = _rewards(_shape_env("opp_wrong", np.full(n, 0.1)), [2, 2, 2])      # lado certo, sinal convergiu
+    assert abs(r[1] - (-lam * (k0 - 0.1))) < 1e-9, r
+    r = _rewards(_shape_env("opp_wrong", np.full(n, 1.0)), [2, 2, 2])      # lado certo, sinal moderado
+    assert abs(r[1]) < 1e-9, r
+    # "posição fixa o dia todo" (atrator do oracle_c1) com z oscilando: perde em média
+    zz = np.tile([3.0, -3.0], n // 2)
+    fixa = _rewards(_shape_env("opp_wrong", zz), [1] * (n - 1)).sum()
+    certa = _rewards(_shape_env("opp_wrong", zz), [2, 1] * ((n - 1) // 2) + [2])[:n - 1].sum()
+    assert fixa < 0
+
+    # pbrs: entrar comprado com z_{t+1} = -2 => F = gamma * c * (+1) * (2) = +10 (gamma=1)
+    zp = np.array([0.0, -2.0, -2.0, -2.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    e = _shape_env("pbrs", zp)
+    e.reset()
+    _, r0, _, _, _ = e.step(1)
+    open_cost = WIN_COST_PER_SIDE_BRL + BOVA_COST_PCT_PER_SIDE * 24000.0        # R$ 5,77 (V_BOVA = W/5)
+    assert abs(e.total_shaping - 10.0) < 1e-9, e.total_shaping              # Phi(s)=0 -> Phi(s')=5*1*2
+    assert abs(r0 - (10.0 - open_cost)) < 1e-9, r0                          # o PPO vê shaping + P/L real
+    assert abs(e.total_reward - (-open_cost)) < 1e-9                        # o P/L REAL só tem o custo
+    # entrada no lado ERRADO (comprado com WIN caro, z=+2): F = -10
+    zw = np.array([0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    ew = _shape_env("pbrs", zw)
+    ew.reset()
+    ew.step(1)
+    assert abs(ew.total_shaping - (-10.0)) < 1e-9, ew.total_shaping
+    # TELESCOPAGEM (gamma=1, Phi=0 no terminal e no início): a soma do shaping no episódio é 0
+    rng = np.random.default_rng(0)
+    zr = rng.normal(0, 2, 200)
+    ep = _shape_env("pbrs", zr, W=120000 + np.cumsum(rng.normal(0, 5, 200)))
+    ep.reset()
+    for a in rng.integers(0, 3, 400):
+        _, _, term, _, _ = ep.step(int(a))
+        if term:
+            break
+    assert abs(ep.total_shaping) < 1e-6, ep.total_shaping
+    # com gamma < 1 a soma NÃO é zero (prova de que o gamma entra)
+    ep2 = _shape_env("pbrs", zr, W=120000 + np.cumsum(rng.normal(0, 5, 200)), gamma="0.9")
+    ep2.reset()
+    for a in rng.integers(0, 3, 400):
+        _, _, term, _, _ = ep2.step(int(a))
+        if term:
+            break
+    assert abs(ep2.total_shaping) > 1e-3
+
+    # regret: ideal = comprado (z[t-1] = -3), posição = flat, dpar > 0 => -lam * dpar
+    W = np.array([120000, 120000, 120100, 120100, 120100, 120100], float)   # +100 pts no tick 2
+    zg = np.array([0.0, -3.0, -3.0, -3.0, -3.0, -3.0])
+    eg = _shape_env("regret", zg, W=W)
+    eg.reset()
+    eg.step(0); eg.step(0)                          # t=0, t=1: flat; dpar(t=2) ainda não
+    _, r2, _, _, _ = eg.step(0)                     # t=2: dW=+100 => dpar = 0,2*100 = 20 (BOVA parado)
+    assert abs(r2 - (-lam * 20.0)) < 1e-9, r2
+    # se já está comprado, não há arrependimento
+    eh = _shape_env("regret", zg, W=W)
+    eh.reset()
+    eh.step(1); eh.step(1)
+    _, r2h, _, _, _ = eh.step(1)
+    assert abs(r2h - 20.0) < 1e-6 or abs(r2h) > 0    # recebe o MtM real; sem penalidade extra
+    assert eh.total_shaping == 0.0, eh.total_shaping
+
+    # shaping NUNCA muda o P/L real: mesmas ações, com e sem shaping
+    rng = np.random.default_rng(1)
+    Wr = 120000 + np.cumsum(rng.normal(0, 8, 300))
+    zr2 = rng.normal(0, 2, 300)
+    acts = rng.integers(0, 3, 299)
+    ref = _shape_env("none", zr2, W=Wr)
+    _rewards(ref, acts)
+    for kind in ("opp_flat", "opp_wrong", "pbrs", "regret"):
+        e = _shape_env(kind, zr2, W=Wr)
+        _rewards(e, acts)
+        assert abs(e.total_reward - ref.total_reward) < 1e-9, (kind, e.total_reward, ref.total_reward)
+        assert e.real_pnl_brl == e.total_reward
+    print("shaping (opp_flat, opp_wrong, pbrs, regret): OK — P/L real intacto, PBRS telescopa")
+
+
 if __name__ == "__main__":
     test_synthetic()
     test_real_day()
     test_reward_clip()
     test_cost_curriculum()
+    test_shaping()
