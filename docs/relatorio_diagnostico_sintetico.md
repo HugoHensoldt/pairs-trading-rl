@@ -207,9 +207,57 @@ Treinos locais de 6M timesteps (61 atualizações de PPO, mesmos hiperparâmetro
 4. **Passo de otimização:** 10 épocas × 24 minibatches = 240 passos de gradiente por atualização com lr 3e-4; testar menos épocas / lr menor para o crítico visitar estados com posição antes da política congelar.
 5. **Aquecimento:** iniciar a política numa regra que já opera na região certa (evita o atrator de ação constante por construção).
 
+## 8. Rodada de shaping de recompensa (24–25/09/2026): `pbrs` resolve o que as correções pontuais não resolveram
+
+10 execuções de 30M timesteps, versão hedgeada, par sintético cointegrado (`slurm/submit_shaping.sh`, commit `7a55237`), terminadas sem erro. Duas rodadas × 5 formatos de `SHAPING_KIND` (termo somado só ao que o PPO vê por tick; `total_reward`/P/L real intacto — testado):
+
+- **Rodada A — features da própria versão hedgeada** (`STATE_KIND=spread`: `spread_compra`, `spread_venda`, posição, P/L; sinal do shaping = as próprias features). Confirma se a versão hedgeada, com o estado que ela já usa, consegue arbitrar.
+- **Rodada B — só preços + tempo cíclico, sem spread** (`STATE_KIND=raw`, `RAW_LEVELS=0`; sinal do shaping = spread verdadeiro do sintético, só como professor na recompensa, nunca na observação). Repete a pergunta da §7 (o RL consegue redescobrir a cointegração a partir de preços brutos?) agora com um professor na recompensa em vez de só na observação.
+
+### 8.1 Resultado: `pbrs` é o único formato consistentemente lucrativo nas duas rodadas
+
+![Checkpoints por formato de shaping](img/v7_fig1_shaping_checkpoints.png)
+
+**Fig. 3.** P/L real médio por dia no teste (30 pregões), por checkpoint, para os 5 formatos — rodada A (esquerda) e B (direita). A linha tracejada é a regra ótima causal (+62,9 R$/dia).
+
+![Fração da regra ótima capturada](img/v7_fig2_shaping_fracao.png)
+
+**Fig. 4.** Fração da regra ótima capturada no teste (melhor-de-validação), por formato.
+
+| Formato | A: melhor-val teste (R$, 30 dias) | A: % da regra ótima | A: faixa nos 5 checkpoints | B: melhor-val teste | B: % da regra ótima | B: faixa nos 5 checkpoints |
+|---|---|---|---|---|---|---|
+| `none` (controle) | +530 | 28% | −252 a +316 | −192 | −10% | −306 a −26 |
+| `opp_flat` | −286 | −15% | −544 a −286 | +10 | 1% | −622 a +10 |
+| `opp_wrong` | +1.591 | 84% | **−1.444 a +2.400** | +265 | 14% | −226 a +545 |
+| **`pbrs`** | **+3.852** | **204%** | **+3.079 a +3.852** | **+1.955** | **104%** | **+807 a +2.699** |
+| `regret` | +1.067 | 57% | −257 a +1.067 | −42 | −2% | −359 a −111 |
+
+- **`pbrs` (A):** melhor checkpoint já na **primeira avaliação (5M timesteps)**, +3.852 R$ no teste (204% da regra ótima — mais que o dobro), e permanece positivo e estável do início ao fim do treino (nunca abaixo de +3.079 R$ nos 5 checkpoints). Nenhum outro formato chega perto dessa estabilidade: `opp_wrong`, por exemplo, tem média boa (84%) mas oscila entre −1.444 e +2.400 R$ — put de cara ou coroa dependendo do checkpoint.
+- **`pbrs` (B) — o teste mais rigoroso:** sem nenhuma feature de spread na observação, só preços brutos e tempo cíclico, com o professor entrando **apenas na recompensa de treino**, o agente ainda captura 104% da regra ótima (+1.955 R$ no teste) e **nunca fica negativo** em nenhum dos 5 checkpoints (mínimo +807 R$). Isso é o que a bissecção da §7.3 (`oracle_c1`) não conseguiu: ali, com o spread verdadeiro *na observação*, a política colapsava para uma posição fixa. Com PBRS, o mesmo problema não aparece, mesmo com uma observação estritamente mais pobre (sem o spread em lugar nenhum, nem na observação).
+- **Os demais formatos (`opp_flat`, `opp_wrong`, `regret`) não resolvem o colapso de forma confiável.** `opp_flat` é o pior (negativo ou ~0 nas duas rodadas) — penalizar só ficar flat sem operar não ataca o atrator "posição fixa". `opp_wrong` e `regret` melhoram a média na rodada A, mas com variância enorme entre checkpoints (o mesmo padrão de instabilidade do baseline), e não funcionam na rodada B.
+- **O controle (`none`) desta rodada já é diferente do baseline `syn_coint_s0`.** Com o estado da versão hedgeada (`STATE_KIND=spread`) em vez do raw completo, `A_none` chega a 28% da regra ótima no teste — mas só no **último checkpoint (30M)**; os 4 anteriores são negativos ou ~0. Isso é consistente com a leitura da §0: sem shaping, o agente eventualmente escapa do atrator, mas tarde e sem garantia (repetir com outra seed poderia não escapar).
+
+### 8.2 Diagnóstico de arbitragem em `pbrs`: comportamento causal, não memorização
+
+Do `diagnose_agent.py` no melhor checkpoint de cada `pbrs`:
+
+- **B_pbrs responde à diferença entre os ativos, no sinal certo** (teste de impulso): `win_up` → preferência **negativa** (−0,22 a −0,35); `win_down` e `bova_up` → **positiva** (+0,27 a +0,51); os dois subindo juntos → **~0** (0,01–0,02). É exatamente a assinatura de um arbitrador — reage à diferença, não ao nível — e contrasta com o `oracle_c1`/`raw_nolevels_c1` da §7 (resposta ~0,000, logits saturados). A_pbrs também tem sinais corretos em `win_up`/`win_down`, mas `bova_up` dá 0,000: artefato de `spread_compra`/`venda` usarem `Wbjusto`/`Wajusto` como médias móveis de 3.000 ticks pré-calculadas — um choque isolado de 1 tick no BOVA11 não move essa média a tempo de aparecer no teste de impulso (limitação do teste para o estado `spread`, não do `pbrs`).
+- **B_pbrs depende de verdade da perna BOVA11** (placebo de emparelhamento): substituir o BOVA11 por outro dia, congelá-lo ou atrasá-lo 100–1.000 ticks derruba o P/L para **−1,86× a −4,59× o original** (chega a ficar negativo). Só o atraso de 10 ticks é tolerado (0,15×). Isso é evidência de que a política aprendeu a relação entre os dois ativos a partir de preços brutos, não um atalho só-WIN.
+- **O mesmo placebo não é válido para A_pbrs** (nem para nenhuma execução com `STATE_KIND=spread`): `Wbjusto`/`Wajusto` são colunas pré-calculadas por `process_day()` a partir dos dados originais, e o placebo perturba `bbid`/`bask` *depois*, sem recalcular essas colunas — por isso `bova_lag*`/`bova_frozen`/`bova_other_day` dão exatamente `pnl_relativo_ao_original = 1.00` em A_pbrs (o teste não teve efeito algum). Limitação do arcabouço de diagnóstico para esse estado, registrada aqui para não ler esse "1.00 em tudo" como "ignora o BOVA11".
+- **Alinhamento (A):** `A_pbrs` tem Spearman 1,000 com a razão-média-móvel (o próprio estado é função dela) e 0,885 com o spread verdadeiro. `B_pbrs`, sem nenhuma dessas features na entrada, ainda alcança Spearman 0,55–0,63 com os métodos clássicos e com o spread verdadeiro — a rede reconstruiu algo equivalente à cointegração a partir de preços brutos.
+- **Eventos (D):** entradas com 47–62 pts de desvio a favor (89–98% delas do lado certo), convergência mantida 100 ticks depois, reversão ao fechar — o padrão clássico de um negócio de reversão à média, igual ao da regra ótima.
+
+### 8.3 Leitura
+
+`pbrs` ataca exatamente o mecanismo identificado na §7: ele dá recompensa densa e **teoricamente neutra em relação à política ótima** (Ng et al., 1999) a cada tick, então o agente recebe sinal de gradiente para "estar do lado certo da convergência" muito antes de qualquer negócio fechar — ele não precisa sobreviver ao vale de custo inicial para descobrir a região lucrativa. Os outros formatos (`opp_flat`, `opp_wrong`, `regret`) são esparsos ou descontínuos (só penalizam fora de certas condições) e não dão esse gradiente denso, daí a instabilidade.
+
+A rodada B confirma, com o professor **só na recompensa**, que **o problema era mesmo de treino, não de representação**: o mesmo estado raw que colapsava para posição fixa na §7.3 agora arbitra de verdade (104% da regra ótima, resposta a impulso com o sinal certo, dependência real da perna BOVA11) assim que a exploração inicial é guiada por PBRS.
+
+**Ressalvas:** 1 seed por formato; A_pbrs supera 100% da regra ótima porque a regra usa um limiar fixo escolhido numa grade grosseira (1,0–3,5σ) — plausível que uma política adaptativa capture mais que isso, mas não descarta sorte de uma seed específica. `λ`, `k`, `k0`, `c` do shaping são valores razoáveis, não calibrados. O placebo (C) não é válido para o estado `spread` (ver acima). PBRS ainda não foi testado nos dados reais.
+
 ## Apêndice: arquivos e reprodução
 
-- **Resultados brutos:** `sdumont_backup_sintetico/` (`sintetico_progresso.md` com o log completo da campanha; `pairs-trading-rl/src/runs/syn_{coint,null}_s0/fold1/` com `state.json`, `val_curve.csv`, `logs/chunk*/progress.csv`, `eval/*`, `diag/*`).
-- **Figuras:** `python src/analyze_synthetic.py` (no WSL/venv com matplotlib).
-- **Como foi gerado:** `slurm/submit_synthetic.sh` (driver autônomo) + `slurm/submit_diag.sbatch`; código em `src/synthetic_pair.py`, `src/synthetic_benchmark.py`, `src/diagnose_agent.py`, `src/rl_trading_pipeline.py` (`build_raw_features`, `STATE_KIND=raw`).
-- **Branch/commit:** `estado-simplificado-v4`, commit `ba3c7f5` (código que gerou o baseline); `4ea6be0` (correção de memória, modo `oracle` e `probe_raw_information.py`, usados na §7).
+- **Resultados brutos:** `sdumont_backup_sintetico/` (`sintetico_progresso.md`, `pairs-trading-rl/src/runs/syn_{coint,null}_s0/fold1/`) e `sdumont_backup_shaping/` (`shaping_progresso.md`, `pairs-trading-rl/src/runs/syn_shape_*_s0/fold1/`), cada um com `state.json`, `val_curve.csv`, `logs/chunk*/progress.csv`, `eval/*`, `diag/*`.
+- **Figuras:** `python src/analyze_synthetic.py` (Fig. 1–2) e `python src/analyze_shaping.py` (Fig. 3–4), no WSL/venv com matplotlib.
+- **Como foi gerado:** `slurm/submit_synthetic.sh` + `slurm/submit_diag.sbatch` (§0–7); `slurm/submit_shaping.sh` (§8); código em `src/synthetic_pair.py`, `src/synthetic_benchmark.py`, `src/diagnose_agent.py`, `src/rl_trading_pipeline.py` (`build_raw_features`, `STATE_KIND=raw`, `HedgedPairEnv._shaping`, `SHAPING_KIND`).
+- **Branch/commit:** `estado-simplificado-v4`. `ba3c7f5` (baseline §0–6); `4ea6be0` (correção de memória, modo `oracle`, §7); `7a55237` (shaping, §8).
