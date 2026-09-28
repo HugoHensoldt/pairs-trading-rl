@@ -38,6 +38,12 @@ Modificações desta versão (marcadas no código como [MUDANÇA 1..7]):
               `--stage compare` compara experimentos.
   [MUDANÇA 7] Execução no Santos Dumont: estágios (--stage), tarefas
               (fold, lado) com checkpoint/retomada e geração em paralelo.
+  [MUDANÇA 12] Modo "um modelo por combinação" (LSTM_PER_COMBO=1): uma LSTM
+              independente por (fold, lado, combinação), treinada só com as
+              oportunidades daquela combinação -- responde se, para uma
+              estratégia (sigma, Re, Ri) fixa, a LSTM separa operações boas
+              de ruins melhor que a própria taxa de acerto da estratégia.
+              Desligado por padrão; não muda o comportamento existente.
 
 Parâmetros da heurística: `sigma` = largura da banda de Bollinger;
 `Re` = realização (fração do caminho até o alvo que queremos lucrar);
@@ -52,6 +58,13 @@ Uso:
   python src/lstm_pipeline.py --stage pending        # tarefas ainda não concluídas
   python src/lstm_pipeline.py --stage aggregate      # tabela final de métricas
 No Santos Dumont use slurm/submit_lstm.sh (encadeia os jobs).
+
+Modo por combinação [MUDANÇA 12] (LSTM_PER_COMBO=1; requer --stage pl já rodado):
+  LSTM_PER_COMBO=1 python src/lstm_pipeline.py --stage train --fold 1 --side buy \
+      --combo 0,1   # teste curto: só as combinações 0 e 1
+  LSTM_PER_COMBO=1 python src/lstm_pipeline.py --stage train --fold 1 --side buy
+      # todas as combinações pendentes desse (fold, lado), no orçamento de tempo do job
+  LSTM_PER_COMBO=1 python src/lstm_pipeline.py --stage aggregate   # lstm_percombo_results.csv
 """
 
 import argparse
@@ -73,7 +86,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
                              precision_score, recall_score, roc_auc_score,
-                             confusion_matrix)
+                             confusion_matrix, log_loss)
 
 # TensorFlow é importado de forma tolerante: os estágios de geração de
 # amostras e de relatório (--stage generate/report/pending/aggregate) só usam
@@ -1032,8 +1045,12 @@ def fold_orders(dev_orders, fold, n_splits=N_SPLITS):
     raise ValueError(f"fold {fold} fora de 1..{n_splits}")
 
 
-def task_dir(fold, side):
-    return RUN_ROOT / f"fold{fold}_{side}"
+def task_dir(fold, side, combo=None):
+    # [MUDANÇA 12] combo=None preserva o caminho de sempre; com combo, cada
+    # combinação tem seu próprio diretório -- nunca sobrescreve fold{f}_{lado}/.
+    if combo is None:
+        return RUN_ROOT / f"fold{fold}_{side}"
+    return RUN_ROOT / f"fold{fold}_{side}_c{combo}"
 
 
 def _write_json_atomic(path, obj):
@@ -1045,23 +1062,284 @@ def _write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
-def _new_state(fold, side):
-    return {'fold': fold, 'side': side, 'epochs_done': 0, 'best_val_loss': float('inf'),
+def _new_state(fold, side, combo=None):
+    return {'fold': fold, 'side': side, 'combo': combo, 'epochs_done': 0, 'best_val_loss': float('inf'),
             'wait': 0, 'done': False, 'finished': False, 'chunks': 0, 'history': []}
 
 
-def read_state(fold, side):
-    p = task_dir(fold, side) / "state.json"
+def read_state(fold, side, combo=None):
+    p = task_dir(fold, side, combo) / "state.json"
     if p.exists():
         with open(p, encoding="utf-8") as f:
             return json.load(f)
-    return _new_state(fold, side)
+    return _new_state(fold, side, combo)
+
+
+# [MUDANÇA 12] modo "um modelo por combinação": liga com LSTM_PER_COMBO=1. As
+# combinações com poucas amostras são puladas (registrado em metrics.json com
+# status='skipped_low_n'), em vez de treinadas com dados insuficientes.
+PER_COMBO = os.environ.get("LSTM_PER_COMBO", "0") not in ("", "0", "false", "False")
+MIN_TRAIN_PER_COMBO = int(os.environ.get("LSTM_PERCOMBO_MIN_TRAIN", "300"))
+MIN_VAL_PER_COMBO = int(os.environ.get("LSTM_PERCOMBO_MIN_VAL", "100"))
+PERCOMBO_BATCH_DEFAULT = int(os.environ.get("LSTM_PERCOMBO_BATCH", "32"))
+# limiares de probabilidade testados para a regra de aceitação (mesma grade de
+# src/analyze_pl_oportunidades.py), e mínimo de aceitas na validação p/ escolher um
+PERCOMBO_THRESH_SWEEP = np.round(np.arange(0.50, 0.851, 0.01), 2)
+PERCOMBO_MIN_ACEITAS_VAL = int(os.environ.get("LSTM_PERCOMBO_MIN_ACEITAS_VAL", "20"))
+
+
+def _percombo_side_done(fold, side):
+    return all((task_dir(fold, side, ci) / "metrics.json").exists() for ci in range(len(PARAM_GRID)))
 
 
 def pending_tasks(n_splits=N_SPLITS):
-    """Tarefas (fold, lado) ainda não concluídas, na ordem fold 1 buy, fold 1 sell, ..."""
+    """Tarefas (fold, lado) ainda não concluídas, na ordem fold 1 buy, fold 1 sell, ...
+    [MUDANÇA 12] Com LSTM_PER_COMBO=1, "concluída" passa a exigir as len(PARAM_GRID)
+    combinações prontas (mesmo formato de saída: continua uma linha "fold lado" -- os
+    scripts .sbatch existentes funcionam sem alteração; train_percombo_side() treina,
+    numa chamada só, todas as combinações pendentes daquele lado)."""
+    if PER_COMBO:
+        return [(f, s) for f in range(1, n_splits + 1) for s in SIDES if not _percombo_side_done(f, s)]
     return [(f, s) for f in range(1, n_splits + 1) for s in SIDES
             if not read_state(f, s)['finished']]
+
+
+def _auc_bootstrap_by_day(y, p, orders, n_boot=300, seed=0):
+    """IC95% da AUC por bootstrap sobre os PREGÕES (amostras do mesmo dia são
+    correlacionadas). Mesma lógica de report_lstm.auc_day_bootstrap, reimplementada
+    aqui sem matplotlib/pandas para poder rodar no estágio de treino."""
+    if len(y) < 2 or len(np.unique(y)) < 2:
+        return float('nan'), float('nan')
+    rng = np.random.default_rng(seed)
+    order_idx = np.argsort(orders, kind='stable')
+    y, p, orders = y[order_idx], p[order_idx], orders[order_idx]
+    days, starts = np.unique(orders, return_index=True)
+    groups = np.split(np.arange(len(y)), starts[1:])
+    aucs = []
+    for _ in range(n_boot):
+        pick = rng.integers(0, len(groups), len(groups))
+        idx = np.concatenate([groups[i] for i in pick])
+        if len(np.unique(y[idx])) == 2:
+            aucs.append(roc_auc_score(y[idx], p[idx]))
+    if not aucs:
+        return float('nan'), float('nan')
+    return float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5))
+
+
+def _percombo_choose_threshold(p_val, pl_val, min_n=PERCOMBO_MIN_ACEITAS_VAL):
+    """Limiar de probabilidade (grade PERCOMBO_THRESH_SWEEP) que maximiza o P/L médio
+    bruto NA VALIDAÇÃO, com pelo menos `min_n` negociações aceitas; NaN se nenhum
+    limiar atinge esse mínimo (mesmo protocolo de analyze_pl_oportunidades.py)."""
+    best = None
+    for t in PERCOMBO_THRESH_SWEEP:
+        m = p_val >= t
+        if m.sum() < min_n:
+            continue
+        v = float(pl_val[m].mean())
+        if best is None or v > best[1] + 1e-12:
+            best = (float(t), v)
+    return best[0] if best else float('nan')
+
+
+def train_percombo_side(fold, side, combos=None, batch_size=None, max_epochs=50,
+                        patience=8, max_seconds=0):
+    """[MUDANÇA 12] Treina, num único processo (1 import do TensorFlow), TODAS as
+    combinações pendentes de PARAM_GRID para (fold, lado) -- ou só `combos` (lista de
+    índices), usado no teste curto. Cada combinação usa só as suas próprias amostras
+    (load_samples(..., [combo])); a arquitetura, o scaler e o early stopping são os
+    mesmos de train_task, aplicados por combinação. Compartilha o orçamento de tempo
+    do job entre as combinações; a combinação em andamento quando o tempo acaba fica
+    com checkpoint salvo e retoma no próximo job (mesmo mecanismo de train_task)."""
+    if keras is None:
+        raise RuntimeError("TensorFlow não está instalado neste ambiente.")
+    batch_size = batch_size or PERCOMBO_BATCH_DEFAULT
+    combos = list(range(len(PARAM_GRID))) if combos is None else list(combos)
+    dev_orders, test_orders = split_orders()
+    tr_orders, va_orders = fold_orders(dev_orders, fold)
+    # 90s de folga por combinação (avaliação final + salvar); o job inteiro já reserva
+    # os mesmos 90s de margem do lado do .sbatch (LSTM_JOB_SECONDS - MARGIN_SECONDS).
+    deadline = SCRIPT_START + max_seconds - 90 if max_seconds else 0
+    print(f"[fold{fold} {side}] modo por combinação: {len(combos)} combinações a considerar "
+          f"(treino min {MIN_TRAIN_PER_COMBO}, val min {MIN_VAL_PER_COMBO})", flush=True)
+
+    for ci in combos:
+        if deadline and time.time() > deadline:
+            print(f"[fold{fold} {side}] orçamento de tempo esgotado; combinações restantes "
+                  f"(a partir de c{ci}) ficam para o próximo job.", flush=True)
+            break
+        combo = PARAM_GRID[ci]
+        tdir = task_dir(fold, side, ci)
+        tdir.mkdir(parents=True, exist_ok=True)
+        state = read_state(fold, side, ci)
+        if state.get('finished'):
+            continue
+        if os.environ.get("LSTM_SEED"):
+            keras.utils.set_random_seed(int(os.environ["LSTM_SEED"]))
+
+        t0 = time.time()
+        Xtr, ytr = load_samples(tr_orders, [combo])[side]
+        Xva, yva = load_samples(va_orders, [combo])[side]
+        Xte, yte = load_samples(test_orders, [combo])[side]
+        n_tr, n_va, n_te = len(ytr), len(yva), len(yte)
+        print(f"[fold{fold} {side} c{ci} sigma={combo[0]:g} Re={combo[1]:g} Ri={combo[2]:g}] "
+              f"n treino/val/teste: {n_tr}/{n_va}/{n_te} (carga {time.time() - t0:.1f}s)", flush=True)
+
+        if n_tr < MIN_TRAIN_PER_COMBO or n_va < MIN_VAL_PER_COMBO or n_te == 0:
+            metrics = {'fold': fold, 'side': side, 'combo': ci,
+                       'sigma': combo[0], 'Re': combo[1], 'Ri': combo[2],
+                       'status': 'skipped_low_n', 'n_train': n_tr, 'n_val': n_va, 'n_test': n_te,
+                       'min_train': MIN_TRAIN_PER_COMBO, 'min_val': MIN_VAL_PER_COMBO}
+            _write_json_atomic(tdir / "metrics.json", metrics)
+            state.update(done=True, finished=True, skipped=True)
+            _write_json_atomic(tdir / "state.json", state)
+            print(f"[fold{fold} {side} c{ci}] PULADA (poucas amostras).", flush=True)
+            continue
+
+        scaled = scale_datasets({'train': (Xtr, ytr), 'val': (Xva, yva), 'test': (Xte, yte)})
+        Xtr, ytr = scaled['train']
+        Xva, yva = scaled['val']
+        Xte, yte = scaled['test']
+        n_pos = float(ytr.sum())
+        class_weight = {0: 1.0, 1: (len(ytr) - n_pos) / n_pos} if n_pos > 0 else None
+
+        last = tdir / "last.keras"
+        if state['epochs_done'] > 0 and last.exists():
+            model = keras.models.load_model(last)
+            print(f"[fold{fold} {side} c{ci}] retomado (época {state['epochs_done']}).", flush=True)
+        else:
+            state = _new_state(fold, side, ci)
+            model = build_lstm(Xtr.shape[1], Xtr.shape[2])
+        state['chunks'] += 1
+
+        if state['epochs_done'] >= max_epochs:
+            state['done'] = True
+        if not state['done']:
+            model.fit(Xtr, ytr, validation_data=(Xva, yva), epochs=max_epochs,
+                      initial_epoch=state['epochs_done'], batch_size=batch_size,
+                      class_weight=class_weight,
+                      callbacks=[_make_checkpoint_callback(tdir, state, patience, max_epochs, deadline)],
+                      verbose=0)
+        _write_json_atomic(tdir / "state.json", state)
+
+        if not state['done']:
+            print(f"[fold{fold} {side} c{ci}] orçamento esgotado na época {state['epochs_done']}; "
+                  f"retoma no próximo job.", flush=True)
+            break   # tempo do JOB acabou -- as combinações seguintes também ficam para depois
+
+        if (tdir / "best.weights.h5").exists():
+            model.load_weights(tdir / "best.weights.h5")
+        p_val = model.predict(Xva, batch_size=1024, verbose=0).flatten()
+        p_test = model.predict(Xte, batch_size=1024, verbose=0).flatten()
+        order_val = load_sample_meta(va_orders, [combo])[side][0]
+        order_test = load_sample_meta(test_orders, [combo])[side][0]
+
+        base_rate_train, base_rate_test = float(ytr.mean()), float(yte.mean())
+        both = len(np.unique(yte)) == 2
+        auc_test = float(roc_auc_score(yte, p_test)) if both else float('nan')
+        lo, hi = _auc_bootstrap_by_day(yte, p_test, order_test)
+        p_clip = np.clip(p_test, 1e-4, 1 - 1e-4)
+        ll_model = float(log_loss(yte, p_clip, labels=[0, 1])) if len(yte) else float('nan')
+        const = np.clip(base_rate_train, 1e-4, 1 - 1e-4)
+        ll_const = float(log_loss(yte, np.full(len(yte), const), labels=[0, 1])) if len(yte) else float('nan')
+        skill_logloss = (1 - ll_model / ll_const) if ll_const not in (0.0,) and not np.isnan(ll_const) else float('nan')
+
+        # P/L (pontos, cache lateral --stage pl): mesma ordem que Xte/yte/p_test, porque
+        # load_sample_pl e load_samples percorrem pregões e combinações na mesma ordem.
+        pl_val = load_sample_pl(va_orders, [combo])[side]
+        pl_test = load_sample_pl(test_orders, [combo])[side]
+        if not (len(pl_test) == n_te and np.array_equal((pl_test > 0).astype(np.float32), yte.astype(np.float32))):
+            raise RuntimeError(f"P/L desalinhado: fold{fold} {side} combo{ci} "
+                              f"(rode --stage pl antes do modo por combinação)")
+        thr_val = _percombo_choose_threshold(p_val, pl_val)
+
+        best_epoch = None
+        if state['history']:
+            best_epoch = int(np.argmin([h['val_loss'] for h in state['history']])) + 1
+        u = np.unique(order_test)
+        half = max(len(u) // 2, 1)
+        windows = {}
+        for wi, (lo_o, hi_o) in enumerate(((u[0], u[half - 1]), (u[half if half < len(u) else -1], u[-1])), start=1):
+            m = (order_test >= lo_o) & (order_test <= hi_o)
+            a = m & (p_test >= thr_val) if not np.isnan(thr_val) else np.zeros(len(m), bool)
+            windows[f'janela{wi}'] = dict(
+                label=f'{int(lo_o)}–{int(hi_o)}', n=int(m.sum()),
+                pl_sem_filtro=float(pl_test[m].mean()) if m.any() else float('nan'),
+                n_aceitas=int(a.sum()), pl_aceitas=float(pl_test[a].mean()) if a.any() else float('nan'),
+                acerto_aceitas=float((pl_test[a] > 0).mean()) if a.any() else float('nan'))
+
+        metrics = {'fold': fold, 'side': side, 'combo': ci, 'sigma': combo[0], 'Re': combo[1], 'Ri': combo[2],
+                   'status': 'ok', 'n_train': n_tr, 'n_val': n_va, 'n_test': n_te,
+                   'epochs': state['epochs_done'], 'best_val_loss': state['best_val_loss'], 'best_epoch': best_epoch,
+                   'base_rate_train': base_rate_train, 'base_rate_test': base_rate_test,
+                   'auc_test': auc_test, 'auc_test_ci': [lo, hi],
+                   'logloss_model': ll_model, 'logloss_const_taxa_treino': ll_const, 'skill_logloss': skill_logloss,
+                   'thr_val': thr_val, 'windows': windows,
+                   'config': {'tag': RUN_TAG, 'features': KEEP_NAMES, 'n_ticks': N_TICKS,
+                              'units': LSTM_UNITS, 'dropout': LSTM_DROPOUT, 'batch_size': batch_size,
+                              'max_epochs': max_epochs, 'patience': patience, 'seed': os.environ.get("LSTM_SEED"),
+                              'min_train': MIN_TRAIN_PER_COMBO, 'min_val': MIN_VAL_PER_COMBO,
+                              'train_orders': [int(tr_orders[0]), int(tr_orders[-1])],
+                              'val_orders': [int(va_orders[0]), int(va_orders[-1])],
+                              'test_orders': [int(test_orders[0]), int(test_orders[-1])]}}
+        _write_json_atomic(tdir / "metrics.json", metrics)
+        np.savez_compressed(tdir / "predictions.npz", y_val=yva, p_val=p_val, pl_val=pl_val,
+                            y_test=yte, p_test=p_test, order_test=order_test, pl_test=pl_test,
+                            combo=np.asarray(combo, dtype=float))
+        model.save(tdir / "model.keras")
+        if scaled['scaler'] is not None:
+            np.savez(tdir / "scaler.npz", mean=scaled['scaler'].mean_, scale=scaled['scaler'].scale_)
+        state['finished'] = True
+        _write_json_atomic(tdir / "state.json", state)
+        print(f"[fold{fold} {side} c{ci}] CONCLUÍDA: AUC teste {auc_test:.3f} [{lo:.3f};{hi:.3f}] | "
+              f"skill logloss {skill_logloss:+.4f} | épocas {state['epochs_done']} (melhor {best_epoch})", flush=True)
+
+
+def aggregate_percombo_results(csv_path=None):
+    """[MUDANÇA 12] Reúne os metrics.json de todas as (fold, lado, combinação)."""
+    csv_path = csv_path or RUN_ROOT / "lstm_percombo_results.csv"
+    rows = []
+    for fold in range(1, N_SPLITS + 1):
+        for side in SIDES:
+            for ci in range(len(PARAM_GRID)):
+                p = task_dir(fold, side, ci) / "metrics.json"
+                if not p.exists():
+                    continue
+                with open(p, encoding="utf-8") as f:
+                    m = json.load(f)
+                row = {'fold': fold, 'side': side, 'combo': ci, 'sigma': m.get('sigma'),
+                       'Re': m.get('Re'), 'Ri': m.get('Ri'), 'status': m.get('status'),
+                       'n_train': m.get('n_train'), 'n_val': m.get('n_val'), 'n_test': m.get('n_test')}
+                if m.get('status') == 'ok':
+                    row.update(auc_test=m['auc_test'], auc_ci_lo=m['auc_test_ci'][0], auc_ci_hi=m['auc_test_ci'][1],
+                               skill_logloss=m['skill_logloss'], base_rate_train=m['base_rate_train'],
+                               base_rate_test=m['base_rate_test'], epochs=m['epochs'], best_epoch=m.get('best_epoch'),
+                               thr_val=m.get('thr_val'))
+                    for wname, wd in m.get('windows', {}).items():
+                        row[f'{wname}_label'] = wd['label']
+                        row[f'{wname}_pl_sem_filtro'] = wd['pl_sem_filtro']
+                        row[f'{wname}_n_aceitas'] = wd['n_aceitas']
+                        row[f'{wname}_pl_aceitas'] = wd['pl_aceitas']
+                        row[f'{wname}_acerto'] = wd['acerto_aceitas']
+                rows.append(row)
+    if not rows:
+        print("Nenhuma tarefa concluída ainda.")
+        return None
+    df = pd.DataFrame(rows)
+    pd.set_option('display.width', 240)
+    print(df.to_string(index=False))
+    total_possivel = N_SPLITS * len(SIDES) * len(PARAM_GRID)
+    n_ok = int((df.status == 'ok').sum())
+    n_skip = int((df.status == 'skipped_low_n').sum())
+    print(f"\nConcluídas: {n_ok}  |  Puladas (poucas amostras): {n_skip}  |  "
+          f"Pendentes: {total_possivel - n_ok - n_skip}  |  Total possível: {total_possivel}")
+    ok = df[df.status == 'ok']
+    if len(ok):
+        print("\n--- AUC de teste e skill de log-loss por lado (média entre folds e combinações) ---")
+        print(ok.groupby('side')[['auc_test', 'skill_logloss']].agg(['mean', 'std', 'count']).round(4).to_string())
+    RUN_ROOT.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    print(f"\nSalvo em {csv_path}")
+    return df
 
 
 def _make_checkpoint_callback(tdir, state, patience, max_epochs, deadline):
@@ -1379,6 +1657,9 @@ if __name__ == "__main__":
                         help="atalho: gera as amostras + relatório de balanceamento e para")
     parser.add_argument("--fold", type=int, help="(train) fold 1..N_SPLITS")
     parser.add_argument("--side", choices=SIDES, help="(train) lado")
+    parser.add_argument("--combo", type=str, default=None,
+                        help="(train, com LSTM_PER_COMBO=1) índices de combinação, ex.: '0' ou '0,1,2'; "
+                             "padrão: todas as pendentes do (fold, lado)")
     parser.add_argument("--workers", type=int, default=1, help="(generate/all) processos em paralelo")
     parser.add_argument("--limit", type=int, default=0, help="(pending) no máximo N tarefas")
     parser.add_argument("--batch-size", type=int, default=0,
@@ -1398,7 +1679,7 @@ if __name__ == "__main__":
         for fold, side in pending_tasks()[: args.limit or None]:
             print(fold, side)
     elif args.stage == "aggregate":
-        aggregate_results()
+        aggregate_percombo_results() if PER_COMBO else aggregate_results()
     elif args.stage == "compare":
         compare_runs()
     elif args.stage == "pl":
@@ -1407,10 +1688,16 @@ if __name__ == "__main__":
     elif args.stage == "train":
         if not args.fold or not args.side:
             parser.error("--stage train exige --fold e --side")
-        train_task(args.fold, args.side, batch_size=args.batch_size or 256,
-                   max_epochs=args.max_epochs, patience=args.patience,
-                   use_oversampling=use_oversampling,
-                   max_seconds=int(os.environ.get("LSTM_TRAIN_MAX_SECONDS", "0")))
+        if PER_COMBO:
+            combos = [int(x) for x in args.combo.split(",")] if args.combo else None
+            train_percombo_side(args.fold, args.side, combos=combos, batch_size=args.batch_size or None,
+                               max_epochs=args.max_epochs, patience=args.patience,
+                               max_seconds=int(os.environ.get("LSTM_TRAIN_MAX_SECONDS", "0")))
+        else:
+            train_task(args.fold, args.side, batch_size=args.batch_size or 256,
+                       max_epochs=args.max_epochs, patience=args.patience,
+                       use_oversampling=use_oversampling,
+                       max_seconds=int(os.environ.get("LSTM_TRAIN_MAX_SECONDS", "0")))
     else:  # all | generate | report
         print("Desenvolvimento (TimeSeriesSplit):", dev_orders[0], "..", dev_orders[-1])
         print("Teste:", test_orders)

@@ -45,6 +45,14 @@ EXPERIMENTS=(
     "bal|LSTM_COMBO_BALANCE=1"                                      # só 1: cada combinação 50/50 (mantém SL/SG)
     "nosl|LSTM_DROP_FEATURES=SL,SG"                                 # só 2: sem SL/SG (class_weight global, como na v2)
     "balnosl_s2|LSTM_COMBO_BALANCE=1 LSTM_DROP_FEATURES=SL,SG LSTM_SEED=2"   # ruído entre sementes da variante 1+2
+    # --- modo "um modelo por combinação" (LSTM_PER_COMBO=1; ver src/report_percombo.py) ---
+    # Uma LSTM independente por (fold, lado, combinação sigma/Re/Ri), treinada só com as
+    # oportunidades daquela combinação -- não precisa de LSTM_COMBO_BALANCE/LSTM_DROP_FEATURES
+    # (cada modelo já vê uma única combinação, então SL/SG não revelam nada). Bem mais tarefas
+    # (5 folds x 2 lados x 27 combinações = 270): se MAX_TRAIN_JOBS=30 (padrão do submit_lstm.sh)
+    # não bastar, rode de novo com MAX_TRAIN_JOBS maior ou STAGES="train aggregate".
+    "percombo|LSTM_PER_COMBO=1"
+    "percombo_s2|LSTM_PER_COMBO=1 LSTM_SEED=2"     # ruído entre sementes do modo por combinação
 )
 
 for exp in "${EXPERIMENTS[@]}"; do
