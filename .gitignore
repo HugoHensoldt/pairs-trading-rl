@@ -43,3 +43,7 @@ src/runs/
 # stderr cru do Slurm) nunca deve ser versionado em lugar nenhum do repo.
 sdumont_backup*/
 pairs-rl-logs/
+
+# Projeto LaTeX do paper e dos slides: fica só local, não é público
+# enquanto o paper não sai (submissão/revisão em andamento).
+docs/tex/
