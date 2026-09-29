@@ -36,3 +36,10 @@ venv/
 # Saídas de treino/avaliação da v4 (checkpoints, logs, CSVs, cache de dias)
 runs/
 src/runs/
+
+# Backups brutos de rodadas do Santos Dumont (sdumont_backup*/): ficam só
+# locais, nunca versionados -- o que é publicável (tabelas, figuras,
+# relatório) já vai pra docs/ com nome próprio. pairs-rl-logs/ (stdout/
+# stderr cru do Slurm) nunca deve ser versionado em lugar nenhum do repo.
+sdumont_backup*/
+pairs-rl-logs/
